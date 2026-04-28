@@ -288,6 +288,9 @@ async def topic_closed_handler(
             thread_id,
         )
     else:
+        from .codex_history_sync import forget_pending_codex_topic
+
+        await forget_pending_codex_topic(user.id, thread_id)
         logger.debug(
             "Topic closed: no binding (user=%d, thread=%d)", user.id, thread_id
         )

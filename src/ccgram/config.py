@@ -142,6 +142,21 @@ class Config:
             "CCGRAM_PROVIDER", "CCBOT_PROVIDER", "claude"
         )
 
+        codex_history_sync_raw = _env_with_fallback(
+            "CCGRAM_CODEX_HISTORY_SYNC",
+            "CCBOT_CODEX_HISTORY_SYNC",
+            "auto",
+        ).lower()
+        self.codex_history_sync_enabled = (
+            codex_history_sync_raw not in ("0", "false", "no", "off")
+            and self.provider_name.lower() == "codex"
+        )
+        self.codex_history_sync_interval = max(
+            2.0,
+            float(os.getenv("CCGRAM_CODEX_HISTORY_SYNC_INTERVAL", "5.0")),
+        )
+        self.codex_history_sync_file = self.config_dir / "codex_history_topics.json"
+
         # Directory browser: show hidden (dot) directories
         self.show_hidden_dirs: bool = _env_with_fallback(
             "CCGRAM_SHOW_HIDDEN_DIRS", "CCBOT_SHOW_HIDDEN_DIRS"

@@ -15,6 +15,7 @@ from telegram.constants import ChatAction
 from telegram.ext import ContextTypes
 
 from .callback_helpers import get_thread_id as _get_thread_id
+from .codex_history_sync import activate_pending_codex_topic
 from .directory_browser import (
     BROWSE_DIRS_KEY,
     BROWSE_PAGE_KEY,
@@ -394,14 +395,21 @@ async def handle_text_message(
         return
 
     # Unbound topic — show picker or browser
-    if await _handle_unbound_topic(
+    window_id = thread_router.get_window_for_thread(user.id, thread_id)
+    if window_id is None:
+        window_id = await activate_pending_codex_topic(
+            user.id,
+            thread_id,
+            chat.id,
+        )
+    if window_id is None and await _handle_unbound_topic(
         user.id, thread_id, text, context.user_data, message
     ):
         return
 
     # Bound topic — check if window is still alive
-    window_id = thread_router.get_window_for_thread(user.id, thread_id)
-    assert window_id is not None  # _handle_unbound_topic returned False
+    window_id = thread_router.get_window_for_thread(user.id, thread_id) or window_id
+    assert window_id is not None
 
     if await _handle_dead_window(
         window_id, user.id, thread_id, text, context.user_data, message

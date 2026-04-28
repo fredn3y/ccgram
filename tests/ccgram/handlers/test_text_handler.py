@@ -250,6 +250,54 @@ class TestHandleDeadWindow:
 
 
 class TestShellProviderRouting:
+    @patch(f"{_TH}._forward_message", new_callable=AsyncMock)
+    @patch(f"{_TH}.get_provider_for_window")
+    @patch(f"{_TH}._handle_dead_window", new_callable=AsyncMock, return_value=False)
+    @patch(f"{_TH}._handle_unbound_topic", new_callable=AsyncMock)
+    @patch(f"{_TH}.activate_pending_codex_topic", new_callable=AsyncMock)
+    @patch(f"{_TH}.thread_router")
+    async def test_pending_codex_topic_activates_before_unbound_picker(
+        self,
+        mock_tr: MagicMock,
+        mock_activate: AsyncMock,
+        mock_unbound: AsyncMock,
+        _mock_dead: AsyncMock,
+        mock_get_provider: MagicMock,
+        mock_forward: AsyncMock,
+    ) -> None:
+        from ccgram.handlers.text_handler import handle_text_message
+
+        mock_tr.get_window_for_thread.return_value = None
+        mock_activate.return_value = "@9"
+        provider = MagicMock()
+        provider.capabilities.supports_mailbox_delivery = True
+        mock_get_provider.return_value = provider
+
+        update = MagicMock()
+        update.effective_user = MagicMock(id=100)
+        context = MagicMock()
+        context.bot = AsyncMock()
+        context.user_data = {}
+        message = AsyncMock()
+        message.message_thread_id = 42
+        message.text = "continue from mobile"
+        message.chat.id = -100999
+        message.chat.type = "supergroup"
+        update.message = message
+
+        await handle_text_message(update, context)
+
+        mock_activate.assert_awaited_once_with(100, 42, -100999)
+        mock_unbound.assert_not_awaited()
+        mock_forward.assert_awaited_once_with(
+            "@9",
+            100,
+            42,
+            "continue from mobile",
+            context.bot,
+            message,
+        )
+
     @patch(f"{_TH}.get_provider_for_window")
     @patch(f"{_TH}._handle_dead_window", new_callable=AsyncMock, return_value=False)
     @patch(f"{_TH}.thread_router")
