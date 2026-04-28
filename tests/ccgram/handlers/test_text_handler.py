@@ -254,21 +254,25 @@ class TestShellProviderRouting:
     @patch(f"{_TH}.get_provider_for_window")
     @patch(f"{_TH}._handle_dead_window", new_callable=AsyncMock, return_value=False)
     @patch(f"{_TH}._handle_unbound_topic", new_callable=AsyncMock)
-    @patch(f"{_TH}.activate_pending_codex_topic", new_callable=AsyncMock)
+    @patch(f"{_TH}.submit_or_activate_pending_codex_topic", new_callable=AsyncMock)
     @patch(f"{_TH}.thread_router")
-    async def test_pending_codex_topic_activates_before_unbound_picker(
+    async def test_pending_codex_topic_fallback_window_before_unbound_picker(
         self,
         mock_tr: MagicMock,
-        mock_activate: AsyncMock,
+        mock_pending: AsyncMock,
         mock_unbound: AsyncMock,
         _mock_dead: AsyncMock,
         mock_get_provider: MagicMock,
         mock_forward: AsyncMock,
     ) -> None:
+        from ccgram.handlers.codex_history_sync import PendingCodexAction
         from ccgram.handlers.text_handler import handle_text_message
 
         mock_tr.get_window_for_thread.return_value = None
-        mock_activate.return_value = "@9"
+        mock_pending.return_value = PendingCodexAction(
+            "fallback_window",
+            window_id="@9",
+        )
         provider = MagicMock()
         provider.capabilities.supports_mailbox_delivery = True
         mock_get_provider.return_value = provider
@@ -287,7 +291,7 @@ class TestShellProviderRouting:
 
         await handle_text_message(update, context)
 
-        mock_activate.assert_awaited_once_with(100, 42, -100999)
+        mock_pending.assert_awaited_once_with(100, 42, -100999, "continue from mobile")
         mock_unbound.assert_not_awaited()
         mock_forward.assert_awaited_once_with(
             "@9",
@@ -297,6 +301,88 @@ class TestShellProviderRouting:
             context.bot,
             message,
         )
+
+    @patch(f"{_TH}._forward_message", new_callable=AsyncMock)
+    @patch(f"{_TH}._handle_unbound_topic", new_callable=AsyncMock)
+    @patch(f"{_TH}.ack_reaction", new_callable=AsyncMock)
+    @patch(f"{_TH}.submit_or_activate_pending_codex_topic", new_callable=AsyncMock)
+    @patch(f"{_TH}.thread_router")
+    async def test_pending_codex_topic_app_server_submission_returns_without_tmux(
+        self,
+        mock_tr: MagicMock,
+        mock_pending: AsyncMock,
+        mock_ack: AsyncMock,
+        mock_unbound: AsyncMock,
+        mock_forward: AsyncMock,
+    ) -> None:
+        from ccgram.handlers.codex_history_sync import PendingCodexAction
+        from ccgram.handlers.text_handler import handle_text_message
+
+        mock_tr.get_window_for_thread.return_value = None
+        mock_pending.return_value = PendingCodexAction("submitted", message="turn-1")
+
+        update = MagicMock()
+        update.effective_user = MagicMock(id=100)
+        context = MagicMock()
+        context.bot = AsyncMock()
+        context.user_data = {}
+        message = AsyncMock()
+        message.message_thread_id = 42
+        message.message_id = 500
+        message.text = "continue from mobile"
+        message.chat.id = -100999
+        message.chat.type = "supergroup"
+        update.message = message
+
+        with patch("ccgram.handlers.command_history.record_command") as mock_record:
+            await handle_text_message(update, context)
+
+        mock_pending.assert_awaited_once_with(100, 42, -100999, "continue from mobile")
+        mock_ack.assert_awaited_once_with(context.bot, -100999, 500)
+        mock_record.assert_called_once_with(100, 42, "continue from mobile")
+        mock_unbound.assert_not_awaited()
+        mock_forward.assert_not_awaited()
+
+    @patch(f"{_TH}._forward_message", new_callable=AsyncMock)
+    @patch(f"{_TH}._handle_unbound_topic", new_callable=AsyncMock)
+    @patch(f"{_TH}.safe_reply", new_callable=AsyncMock)
+    @patch(f"{_TH}.submit_or_activate_pending_codex_topic", new_callable=AsyncMock)
+    @patch(f"{_TH}.thread_router")
+    async def test_pending_codex_topic_busy_replies_without_forwarding(
+        self,
+        mock_tr: MagicMock,
+        mock_pending: AsyncMock,
+        mock_reply: AsyncMock,
+        mock_unbound: AsyncMock,
+        mock_forward: AsyncMock,
+    ) -> None:
+        from ccgram.handlers.codex_history_sync import PendingCodexAction
+        from ccgram.handlers.text_handler import handle_text_message
+
+        mock_tr.get_window_for_thread.return_value = None
+        mock_pending.return_value = PendingCodexAction(
+            "busy",
+            message="Codex app-server thread is active",
+        )
+
+        update = MagicMock()
+        update.effective_user = MagicMock(id=100)
+        context = MagicMock()
+        context.bot = AsyncMock()
+        context.user_data = {}
+        message = AsyncMock()
+        message.message_thread_id = 42
+        message.text = "second turn"
+        message.chat.id = -100999
+        message.chat.type = "supergroup"
+        update.message = message
+
+        await handle_text_message(update, context)
+
+        mock_reply.assert_awaited_once()
+        assert "already working" in mock_reply.call_args.args[1]
+        mock_unbound.assert_not_awaited()
+        mock_forward.assert_not_awaited()
 
     @patch(f"{_TH}.get_provider_for_window")
     @patch(f"{_TH}._handle_dead_window", new_callable=AsyncMock, return_value=False)

@@ -57,7 +57,7 @@ async def test_command_forwarding(e2e_app, work_dir):
 
     await wait_for_send(
         calls,
-        method="sendChatAction",
+        predicate=lambda d: "Sent: /status" in d.get("text", ""),
         timeout=10,
     )
 

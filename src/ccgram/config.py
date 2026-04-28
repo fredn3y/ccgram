@@ -142,20 +142,7 @@ class Config:
             "CCGRAM_PROVIDER", "CCBOT_PROVIDER", "claude"
         )
 
-        codex_history_sync_raw = _env_with_fallback(
-            "CCGRAM_CODEX_HISTORY_SYNC",
-            "CCBOT_CODEX_HISTORY_SYNC",
-            "auto",
-        ).lower()
-        self.codex_history_sync_enabled = (
-            codex_history_sync_raw not in ("0", "false", "no", "off")
-            and self.provider_name.lower() == "codex"
-        )
-        self.codex_history_sync_interval = max(
-            2.0,
-            float(os.getenv("CCGRAM_CODEX_HISTORY_SYNC_INTERVAL", "5.0")),
-        )
-        self.codex_history_sync_file = self.config_dir / "codex_history_topics.json"
+        self._init_codex()
 
         # Directory browser: show hidden (dot) directories
         self.show_hidden_dirs: bool = _env_with_fallback(
@@ -214,6 +201,43 @@ class Config:
         self.msg_spawn_timeout: int = _parse_int_env("CCGRAM_MSG_SPAWN_TIMEOUT", 300)
         self.msg_spawn_rate: int = _parse_int_env("CCGRAM_MSG_SPAWN_RATE", 3)
         self.msg_rate_limit: int = _parse_int_env("CCGRAM_MSG_RATE_LIMIT", 10)
+
+    def _init_codex(self) -> None:
+        codex_history_sync_raw = _env_with_fallback(
+            "CCGRAM_CODEX_HISTORY_SYNC",
+            "CCBOT_CODEX_HISTORY_SYNC",
+            "auto",
+        ).lower()
+        self.codex_history_sync_enabled = (
+            codex_history_sync_raw not in ("0", "false", "no", "off")
+            and self.provider_name.lower() == "codex"
+        )
+        self.codex_history_sync_interval = max(
+            2.0,
+            float(os.getenv("CCGRAM_CODEX_HISTORY_SYNC_INTERVAL", "5.0")),
+        )
+        self.codex_history_sync_file = self.config_dir / "codex_history_topics.json"
+        app_server_raw = _env_with_fallback(
+            "CCGRAM_CODEX_APP_SERVER",
+            "CCBOT_CODEX_APP_SERVER",
+            "auto",
+        ).lower()
+        self.codex_app_server_enabled = (
+            app_server_raw not in ("0", "false", "no", "off")
+            and self.provider_name.lower() == "codex"
+        )
+        self.codex_app_server_url = os.getenv(
+            "CCGRAM_CODEX_APP_SERVER_URL", "ws://127.0.0.1:9234"
+        )
+        try:
+            self.codex_app_server_timeout = max(
+                0.5,
+                float(os.getenv("CCGRAM_CODEX_APP_SERVER_TIMEOUT", "3.0")),
+            )
+        except ValueError as e:
+            raise ValueError(
+                f"CCGRAM_CODEX_APP_SERVER_TIMEOUT must be a valid number: {e}"
+            ) from e
 
     def _init_live_view(self) -> None:
         self.live_view_interval: int = max(

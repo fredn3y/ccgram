@@ -67,6 +67,46 @@ class TestConfigValid:
 
 
 @pytest.mark.usefixtures("_base_env")
+class TestCodexAppServerConfig:
+    def test_default_disabled_for_non_codex_provider(self):
+        cfg = Config()
+        assert cfg.provider_name == "claude"
+        assert cfg.codex_app_server_enabled is False
+        assert cfg.codex_app_server_url == "ws://127.0.0.1:9234"
+        assert cfg.codex_app_server_timeout == 3.0
+
+    def test_auto_enabled_for_codex_provider(self, monkeypatch):
+        monkeypatch.setenv("CCGRAM_PROVIDER", "codex")
+        cfg = Config()
+        assert cfg.codex_app_server_enabled is True
+
+    @pytest.mark.parametrize("value", ["0", "false", "no", "off"])
+    def test_can_disable_for_codex_provider(self, monkeypatch, value):
+        monkeypatch.setenv("CCGRAM_PROVIDER", "codex")
+        monkeypatch.setenv("CCGRAM_CODEX_APP_SERVER", value)
+        cfg = Config()
+        assert cfg.codex_app_server_enabled is False
+
+    def test_url_and_timeout_override(self, monkeypatch):
+        monkeypatch.setenv("CCGRAM_PROVIDER", "codex")
+        monkeypatch.setenv("CCGRAM_CODEX_APP_SERVER_URL", "ws://localhost:9999")
+        monkeypatch.setenv("CCGRAM_CODEX_APP_SERVER_TIMEOUT", "7.5")
+        cfg = Config()
+        assert cfg.codex_app_server_url == "ws://localhost:9999"
+        assert cfg.codex_app_server_timeout == 7.5
+
+    def test_timeout_clamped(self, monkeypatch):
+        monkeypatch.setenv("CCGRAM_CODEX_APP_SERVER_TIMEOUT", "0.1")
+        cfg = Config()
+        assert cfg.codex_app_server_timeout == 0.5
+
+    def test_invalid_timeout_raises(self, monkeypatch):
+        monkeypatch.setenv("CCGRAM_CODEX_APP_SERVER_TIMEOUT", "soon")
+        with pytest.raises(ValueError, match="CCGRAM_CODEX_APP_SERVER_TIMEOUT"):
+            Config()
+
+
+@pytest.mark.usefixtures("_base_env")
 class TestOwnWindowId:
     def test_own_window_id_default_none(self):
         cfg = Config()

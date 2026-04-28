@@ -12,6 +12,11 @@ import structlog
 from telegram import Bot
 from telegram.error import TelegramError
 
+from ..codex_app_server import (
+    CodexAppServerBusyError,
+    CodexAppServerError,
+    submit_turn_to_app_server,
+)
 from ..config import config
 from ..thread_router import thread_router
 from ..telegram_sender import split_message
@@ -39,6 +44,17 @@ class PendingCodexTopic:
     topic_name: str
     created_at: float
     history_offset: int = 0
+    app_server_thread_id: str = ""
+    last_submitted_prompt: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class PendingCodexAction:
+    """Result of handling a message in a pending Codex topic."""
+
+    status: str
+    window_id: str | None = None
+    message: str = ""
 
 
 @dataclass
@@ -48,6 +64,15 @@ class CodexHistoryState:
     initialized: bool
     seen_session_ids: set[str]
     pending_topics: dict[str, PendingCodexTopic]
+
+
+@dataclass(frozen=True, slots=True)
+class CodexHistoryEntry:
+    """A parsed user/agent message from a Codex transcript."""
+
+    role: str
+    text: str
+    formatted: str
 
 
 def _topic_key(user_id: int, thread_id: int) -> str:
@@ -77,6 +102,9 @@ def _load_state() -> CodexHistoryState:
         try:
             pending[str(key)] = PendingCodexTopic(
                 session_id=str(item["session_id"]),
+                app_server_thread_id=str(
+                    item.get("app_server_thread_id") or item["session_id"]
+                ),
                 summary=str(item.get("summary", "")),
                 cwd=str(item["cwd"]),
                 transcript_path=str(item.get("transcript_path", "")),
@@ -86,6 +114,7 @@ def _load_state() -> CodexHistoryState:
                 topic_name=str(item.get("topic_name", "")),
                 created_at=float(item.get("created_at", 0.0)),
                 history_offset=int(item.get("history_offset", 0)),
+                last_submitted_prompt=str(item.get("last_submitted_prompt", "")),
             )
         except (KeyError, TypeError, ValueError):
             continue
@@ -265,6 +294,7 @@ async def _create_pending_topic(
         thread_id=topic.message_thread_id,
         topic_name=topic_name,
         created_at=time.time(),
+        app_server_thread_id=entry.session_id,
     )
     key = _topic_key(target.user_id, topic.message_thread_id)
     logger.info(
@@ -286,15 +316,24 @@ async def _send_pending_history(
     bot: Bot,
     pending: PendingCodexTopic,
 ) -> PendingCodexTopic:
-    messages, new_offset = _read_codex_event_history(
+    entries, new_offset = _read_codex_event_history_entries(
         pending.transcript_path,
         pending.history_offset,
     )
-    if not messages or new_offset == pending.history_offset:
+    if not entries or new_offset == pending.history_offset:
         return pending
 
-    for message in messages:
-        for chunk in split_message(message, max_length=3900):
+    skipped_submitted_prompt = False
+    for entry in entries:
+        if (
+            entry.role == "user"
+            and pending.last_submitted_prompt
+            and entry.text.strip() == pending.last_submitted_prompt.strip()
+        ):
+            skipped_submitted_prompt = True
+            continue
+
+        for chunk in split_message(entry.formatted, max_length=3900):
             sent = await safe_send(
                 bot,
                 pending.chat_id,
@@ -316,6 +355,10 @@ async def _send_pending_history(
         topic_name=pending.topic_name,
         created_at=pending.created_at,
         history_offset=new_offset,
+        app_server_thread_id=pending.app_server_thread_id,
+        last_submitted_prompt=(
+            "" if skipped_submitted_prompt else pending.last_submitted_prompt
+        ),
     )
 
 
@@ -324,41 +367,144 @@ def _read_codex_event_history(
     start_offset: int,
 ) -> tuple[list[str], int]:
     """Read user/assistant event messages from a Codex transcript."""
-    messages: list[str] = []
+    entries, offset = _read_codex_event_history_entries(transcript_path, start_offset)
+    return [entry.formatted for entry in entries], offset
+
+
+def _read_codex_event_history_entries(
+    transcript_path: str,
+    start_offset: int,
+) -> tuple[list[CodexHistoryEntry], int]:
+    """Read parsed user/assistant event messages from a Codex transcript."""
+    entries: list[CodexHistoryEntry] = []
     offset = max(0, start_offset)
     try:
         with open(transcript_path, "rb") as file:
             file.seek(offset)
             for raw_line in file:
                 offset += len(raw_line)
-                message = _parse_codex_event_history_line(raw_line)
-                if message:
-                    messages.append(message)
+                entry = _parse_codex_event_history_entry(raw_line)
+                if entry is not None:
+                    entries.append(entry)
     except OSError:
         return [], start_offset
-    return messages, offset
+    return entries, offset
 
 
 def _parse_codex_event_history_line(raw_line: bytes) -> str:
+    entry = _parse_codex_event_history_entry(raw_line)
+    return entry.formatted if entry is not None else ""
+
+
+def _parse_codex_event_history_entry(raw_line: bytes) -> CodexHistoryEntry | None:
     try:
         entry = json.loads(raw_line.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
-        return ""
+        return None
 
     if not isinstance(entry, dict) or entry.get("type") != "event_msg":
-        return ""
+        return None
     payload = entry.get("payload")
     if not isinstance(payload, dict):
-        return ""
+        return None
 
     event_type = payload.get("type")
     if event_type == "user_message":
         text = str(payload.get("message") or "").strip()
-        return f"\U0001f464 {text}" if text else ""
+        if not text:
+            return None
+        return CodexHistoryEntry(
+            role="user",
+            text=text,
+            formatted=f"\U0001f464 {text}",
+        )
     if event_type == "agent_message":
         text = str(payload.get("message") or "").strip()
-        return text
-    return ""
+        if not text:
+            return None
+        return CodexHistoryEntry(role="agent", text=text, formatted=text)
+    return None
+
+
+async def submit_or_activate_pending_codex_topic(
+    user_id: int,
+    thread_id: int,
+    chat_id: int,
+    text: str,
+) -> PendingCodexAction:
+    """Submit to app-server for pending Codex topics, falling back to tmux resume."""
+    async with _state_lock:
+        state = _load_state()
+        pending = state.pending_topics.get(_topic_key(user_id, thread_id))
+        if not pending:
+            return PendingCodexAction("not_pending")
+
+    if config.codex_app_server_enabled and pending.app_server_thread_id:
+        try:
+            submission = await submit_turn_to_app_server(
+                config.codex_app_server_url,
+                pending.app_server_thread_id,
+                text,
+                timeout=config.codex_app_server_timeout,
+            )
+        except CodexAppServerBusyError as exc:
+            logger.info(
+                "Codex app-server thread %s is busy for pending topic %d",
+                pending.app_server_thread_id,
+                thread_id,
+            )
+            return PendingCodexAction("busy", message=str(exc))
+        except CodexAppServerError as exc:
+            logger.warning(
+                "Codex app-server submit failed for pending topic %d; "
+                "falling back to tmux resume: %s",
+                thread_id,
+                exc,
+            )
+        else:
+            await _mark_pending_topic_submitted(
+                pending,
+                user_id,
+                thread_id,
+                chat_id,
+                text,
+            )
+            return PendingCodexAction("submitted", message=submission.turn_id)
+
+    window_id = await activate_pending_codex_topic(user_id, thread_id, chat_id)
+    if window_id is None:
+        return PendingCodexAction("failed")
+    return PendingCodexAction("fallback_window", window_id=window_id)
+
+
+async def _mark_pending_topic_submitted(
+    pending: PendingCodexTopic,
+    user_id: int,
+    thread_id: int,
+    chat_id: int,
+    text: str,
+) -> None:
+    thread_router.set_group_chat_id(user_id, thread_id, chat_id)
+    async with _state_lock:
+        state = _load_state()
+        key = _topic_key(user_id, thread_id)
+        current = state.pending_topics.get(key, pending)
+        state.pending_topics[key] = PendingCodexTopic(
+            session_id=current.session_id,
+            summary=current.summary,
+            cwd=current.cwd,
+            transcript_path=current.transcript_path,
+            user_id=current.user_id,
+            chat_id=current.chat_id,
+            thread_id=current.thread_id,
+            topic_name=current.topic_name,
+            created_at=current.created_at,
+            history_offset=current.history_offset,
+            app_server_thread_id=current.app_server_thread_id or current.session_id,
+            last_submitted_prompt=text,
+        )
+        state.seen_session_ids.add(current.session_id)
+        _save_state(state)
 
 
 async def activate_pending_codex_topic(

@@ -1,6 +1,11 @@
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from ccgram.codex_app_server import (
+    CodexAppServerBusyError,
+    CodexAppServerError,
+    CodexTurnSubmission,
+)
 from ccgram.handlers.codex_history_sync import (
     CodexHistoryState,
     PendingCodexTopic,
@@ -8,6 +13,7 @@ from ccgram.handlers.codex_history_sync import (
     _load_state,
     _save_state,
     activate_pending_codex_topic,
+    submit_or_activate_pending_codex_topic,
     sync_codex_history_once,
 )
 from ccgram.handlers.resume_command import ResumeEntry
@@ -22,6 +28,9 @@ def _config(tmp_path):
         codex_history_sync_enabled=True,
         codex_history_sync_interval=5.0,
         codex_history_sync_file=tmp_path / "codex_history_topics.json",
+        codex_app_server_enabled=True,
+        codex_app_server_url="ws://127.0.0.1:9234",
+        codex_app_server_timeout=2.0,
     )
 
 
@@ -155,6 +164,56 @@ async def test_pending_topic_backfills_later_agent_message(tmp_path) -> None:
     assert state.pending_topics["100:77"].history_offset == transcript.stat().st_size
 
 
+async def test_pending_topic_skips_app_server_submitted_user_echo(tmp_path) -> None:
+    transcript = tmp_path / "session.jsonl"
+    first_line = (
+        '{"type":"event_msg","payload":{"type":"user_message",'
+        '"message":"first prompt"}}'
+    )
+    submitted_line = (
+        '{"type":"event_msg","payload":{"type":"user_message",'
+        '"message":"continue from mobile"}}'
+    )
+    agent_line = (
+        '{"type":"event_msg","payload":{"type":"agent_message",'
+        '"message":"mobile answer"}}'
+    )
+    _write_transcript(transcript, first_line)
+    first_offset = transcript.stat().st_size
+    _write_transcript(transcript, first_line, submitted_line, agent_line)
+    pending = PendingCodexTopic(
+        session_id="sess-1",
+        summary="first prompt",
+        cwd="/tmp/project",
+        transcript_path=str(transcript),
+        user_id=100,
+        chat_id=-100999,
+        thread_id=77,
+        topic_name="first prompt - project",
+        created_at=1.0,
+        history_offset=first_offset,
+        app_server_thread_id="sess-1",
+        last_submitted_prompt="continue from mobile",
+    )
+    bot = _bot()
+
+    with (
+        patch(f"{_CHS}.config", _config(tmp_path)),
+        patch(f"{_CHS}.scan_all_sessions", return_value=[]),
+        patch(f"{_CHS}.safe_send", new=AsyncMock()) as mock_safe_send,
+    ):
+        mock_safe_send.return_value = MagicMock()
+        _save_state(CodexHistoryState(True, {"sess-1"}, {"100:77": pending}))
+        await sync_codex_history_once(bot)
+        state = _load_state()
+
+    mock_safe_send.assert_awaited_once()
+    assert mock_safe_send.call_args.args[2] == "mobile answer"
+    updated = state.pending_topics["100:77"]
+    assert updated.history_offset == transcript.stat().st_size
+    assert updated.last_submitted_prompt == ""
+
+
 def test_codex_event_history_reads_only_user_and_agent_messages(tmp_path) -> None:
     transcript = tmp_path / "session.jsonl"
     _write_transcript(
@@ -218,4 +277,128 @@ async def test_activate_pending_topic_resumes_and_binds(tmp_path) -> None:
         window_name="reply hello - project",
     )
     mock_tr.set_group_chat_id.assert_called_once_with(100, 77, -100999)
+    assert state.pending_topics == {}
+
+
+async def test_pending_topic_submits_to_app_server_without_tmux_resume(tmp_path) -> None:
+    pending = PendingCodexTopic(
+        session_id="sess-1",
+        summary="reply hello",
+        cwd="/tmp/project",
+        transcript_path="/tmp/session.jsonl",
+        user_id=100,
+        chat_id=-100999,
+        thread_id=77,
+        topic_name="reply hello - project",
+        created_at=1.0,
+        app_server_thread_id="thread-1",
+    )
+
+    with (
+        patch(f"{_CHS}.config", _config(tmp_path)),
+        patch(f"{_CHS}.thread_router") as mock_tr,
+        patch(f"{_CHS}._create_resume_window", new=AsyncMock()) as mock_create,
+        patch(f"{_CHS}.submit_turn_to_app_server", new=AsyncMock()) as mock_submit,
+    ):
+        mock_submit.return_value = CodexTurnSubmission("thread-1", "turn-1")
+        _save_state(CodexHistoryState(True, {"sess-1"}, {"100:77": pending}))
+
+        action = await submit_or_activate_pending_codex_topic(
+            100,
+            77,
+            -100999,
+            "continue from mobile",
+        )
+        state = _load_state()
+
+    assert action.status == "submitted"
+    assert action.message == "turn-1"
+    mock_submit.assert_awaited_once_with(
+        "ws://127.0.0.1:9234",
+        "thread-1",
+        "continue from mobile",
+        timeout=2.0,
+    )
+    mock_create.assert_not_awaited()
+    mock_tr.set_group_chat_id.assert_called_once_with(100, 77, -100999)
+    updated = state.pending_topics["100:77"]
+    assert updated.last_submitted_prompt == "continue from mobile"
+    assert updated.app_server_thread_id == "thread-1"
+
+
+async def test_pending_topic_busy_does_not_fall_back_to_tmux(tmp_path) -> None:
+    pending = PendingCodexTopic(
+        session_id="sess-1",
+        summary="reply hello",
+        cwd="/tmp/project",
+        transcript_path="/tmp/session.jsonl",
+        user_id=100,
+        chat_id=-100999,
+        thread_id=77,
+        topic_name="reply hello - project",
+        created_at=1.0,
+        app_server_thread_id="thread-1",
+    )
+
+    with (
+        patch(f"{_CHS}.config", _config(tmp_path)),
+        patch(f"{_CHS}._create_resume_window", new=AsyncMock()) as mock_create,
+        patch(f"{_CHS}.submit_turn_to_app_server", new=AsyncMock()) as mock_submit,
+    ):
+        mock_submit.side_effect = CodexAppServerBusyError("active")
+        _save_state(CodexHistoryState(True, {"sess-1"}, {"100:77": pending}))
+
+        action = await submit_or_activate_pending_codex_topic(
+            100,
+            77,
+            -100999,
+            "continue from mobile",
+        )
+
+    assert action.status == "busy"
+    mock_create.assert_not_awaited()
+
+
+async def test_pending_topic_app_server_failure_falls_back_to_tmux(tmp_path) -> None:
+    pending = PendingCodexTopic(
+        session_id="sess-1",
+        summary="reply hello",
+        cwd="/tmp/project",
+        transcript_path="/tmp/session.jsonl",
+        user_id=100,
+        chat_id=-100999,
+        thread_id=77,
+        topic_name="reply hello - project",
+        created_at=1.0,
+        app_server_thread_id="thread-1",
+    )
+
+    with (
+        patch(f"{_CHS}.config", _config(tmp_path)),
+        patch(f"{_CHS}.thread_router") as mock_tr,
+        patch(f"{_CHS}._create_resume_window", new=AsyncMock()) as mock_create,
+        patch(f"{_CHS}.submit_turn_to_app_server", new=AsyncMock()) as mock_submit,
+    ):
+        mock_submit.side_effect = CodexAppServerError("offline")
+        mock_create.return_value = (
+            True,
+            "ok",
+            "reply hello - project",
+            "@5",
+            "codex",
+        )
+        _save_state(CodexHistoryState(True, {"sess-1"}, {"100:77": pending}))
+
+        action = await submit_or_activate_pending_codex_topic(
+            100,
+            77,
+            -100999,
+            "continue from mobile",
+        )
+        state = _load_state()
+
+    assert action.status == "fallback_window"
+    assert action.window_id == "@5"
+    mock_create.assert_awaited_once()
+    mock_tr.bind_thread.assert_called_once()
     assert state.pending_topics == {}

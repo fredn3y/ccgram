@@ -15,7 +15,7 @@ from telegram.constants import ChatAction
 from telegram.ext import ContextTypes
 
 from .callback_helpers import get_thread_id as _get_thread_id
-from .codex_history_sync import activate_pending_codex_topic
+from .codex_history_sync import submit_or_activate_pending_codex_topic
 from .directory_browser import (
     BROWSE_DIRS_KEY,
     BROWSE_PAGE_KEY,
@@ -357,6 +357,39 @@ async def _forward_message(
         await handle_interactive_ui(bot, user_id, window_id, thread_id)
 
 
+async def _handle_pending_codex_topic(
+    user_id: int,
+    thread_id: int,
+    chat_id: int,
+    text: str,
+    bot: Bot,
+    message: Message,
+) -> tuple[bool, str | None]:
+    """Handle pending Codex Desktop topics before generic unbound routing."""
+    pending_action = await submit_or_activate_pending_codex_topic(
+        user_id,
+        thread_id,
+        chat_id,
+        text,
+    )
+    if pending_action.status == "submitted":
+        await ack_reaction(bot, message.chat.id, message.message_id)
+        from .command_history import record_command
+
+        record_command(user_id, thread_id, text)
+        return True, None
+    if pending_action.status == "busy":
+        await safe_reply(
+            message,
+            "\u23f3 Codex Desktop is already working in this thread. "
+            "Try again when the current turn finishes.",
+        )
+        return True, None
+    if pending_action.status == "fallback_window":
+        return False, pending_action.window_id
+    return False, None
+
+
 async def handle_text_message(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -397,11 +430,16 @@ async def handle_text_message(
     # Unbound topic — show picker or browser
     window_id = thread_router.get_window_for_thread(user.id, thread_id)
     if window_id is None:
-        window_id = await activate_pending_codex_topic(
+        handled, window_id = await _handle_pending_codex_topic(
             user.id,
             thread_id,
             chat.id,
+            text,
+            context.bot,
+            message,
         )
+        if handled:
+            return
     if window_id is None and await _handle_unbound_topic(
         user.id, thread_id, text, context.user_data, message
     ):
