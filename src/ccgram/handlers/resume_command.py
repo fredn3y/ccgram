@@ -1,10 +1,9 @@
-"""Resume command — browse and resume past Claude Code sessions.
+"""Resume command — browse and resume past agent sessions.
 
-Implements /resume: scans session data under ~/.claude/projects/, supporting
-both legacy sessions-index.json and bare JSONL files (Claude Code >= Feb 2026).
-Groups sessions by project directory and shows a paginated inline keyboard.
-On selection, creates a tmux window with `claude --resume <id>` and binds
-the current topic.
+Implements /resume: scans provider-specific session data, groups sessions by
+project directory, and shows a paginated inline keyboard. On selection, creates
+a tmux window with the provider's native resume command and binds the current
+topic.
 
 Key functions:
   - resume_command: /resume handler
@@ -13,6 +12,7 @@ Key functions:
 """
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -45,6 +45,7 @@ from .user_state import RESUME_SESSIONS
 logger = structlog.get_logger()
 
 _SESSIONS_PER_PAGE = 6
+_CODEX_SCAN_LINES = 80
 
 _IndexParseError = (json.JSONDecodeError, OSError)
 
@@ -58,15 +59,32 @@ class ResumeEntry:
     cwd: str
 
 
-def scan_all_sessions() -> list[ResumeEntry]:
+def scan_all_sessions(provider_name: str | None = None) -> list[ResumeEntry]:
     """Scan project directories for resumable sessions.
 
-    Supports both legacy sessions-index.json and bare JSONL files
-    (Claude Code >= Feb 2026 no longer writes index files).
+    Claude sessions live under ``~/.claude/projects``. Codex sessions live
+    under ``~/.codex/sessions/YYYY/MM/DD``. Unsupported providers keep the
+    legacy Claude-compatible scan path.
 
     Returns entries sorted by file mtime (most recent first),
     deduplicated by session_id.
     """
+    provider = _resolve_resume_provider(provider_name)
+    if provider == "codex":
+        return _scan_codex_sessions()
+    return _scan_claude_sessions()
+
+
+def _resolve_resume_provider(provider_name: str | None) -> str:
+    """Return the provider whose history should be scanned."""
+    raw_provider = provider_name
+    if raw_provider is None:
+        raw_provider = getattr(config, "provider_name", "claude")
+    return str(raw_provider or "claude").lower()
+
+
+def _scan_claude_sessions() -> list[ResumeEntry]:
+    """Scan Claude-style project directories for resumable sessions."""
     if not config.claude_projects_path.exists():
         return []
 
@@ -87,6 +105,134 @@ def scan_all_sessions() -> list[ResumeEntry]:
 
     candidates.sort(key=lambda c: c[0], reverse=True)
     return [entry for _, entry in candidates]
+
+
+def _codex_sessions_dir() -> Path:
+    """Resolve Codex's session transcript directory."""
+    codex_home = os.getenv("CODEX_HOME")
+    if codex_home:
+        return Path(codex_home).expanduser() / "sessions"
+    return Path.home() / ".codex" / "sessions"
+
+
+def _scan_codex_sessions() -> list[ResumeEntry]:
+    """Scan Codex JSONL transcripts for resumable sessions."""
+    sessions_dir = _codex_sessions_dir()
+    if not sessions_dir.exists():
+        return []
+
+    candidates: list[tuple[float, ResumeEntry]] = []
+    seen_ids: set[str] = set()
+
+    try:
+        jsonl_files = sessions_dir.rglob("*.jsonl")
+    except OSError:
+        return []
+
+    for jsonl_file in jsonl_files:
+        session = _read_codex_resume_entry(jsonl_file)
+        if session is None or session.session_id in seen_ids:
+            continue
+
+        try:
+            mtime = jsonl_file.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+
+        seen_ids.add(session.session_id)
+        candidates.append((mtime, session))
+
+    candidates.sort(key=lambda c: c[0], reverse=True)
+    return [entry for _, entry in candidates]
+
+
+def _read_codex_resume_entry(jsonl_file: Path) -> ResumeEntry | None:
+    """Read enough of a Codex transcript to build a resume picker entry."""
+    session_id = ""
+    cwd = ""
+    summary = ""
+
+    for data, payload in _iter_codex_payloads(jsonl_file):
+        if data.get("type") == "session_meta":
+            session_id = _first_str(payload.get("id"), session_id)
+            cwd = _first_str(payload.get("cwd"), cwd)
+
+        if not summary:
+            summary = _extract_codex_user_summary(data, payload)
+
+        if session_id and cwd and summary:
+            break
+
+    if not session_id or not cwd:
+        return None
+    return ResumeEntry(session_id, summary or session_id[:12], cwd)
+
+
+def _iter_codex_payloads(jsonl_file: Path):
+    """Yield parsed Codex transcript entries with dict payloads."""
+    try:
+        with jsonl_file.open("r", encoding="utf-8") as f:
+            for idx, line in enumerate(f):
+                if idx >= _CODEX_SCAN_LINES:
+                    break
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(data, dict):
+                    continue
+
+                payload = data.get("payload")
+                if not isinstance(payload, dict):
+                    continue
+
+                yield data, payload
+    except OSError:
+        return
+
+
+def _first_str(value: object, fallback: str = "") -> str:
+    """Return value if it is a non-empty string, otherwise fallback."""
+    return value if isinstance(value, str) and value else fallback
+
+
+def _extract_codex_user_summary(data: dict, payload: dict) -> str:
+    """Extract the first visible user prompt from a Codex transcript entry."""
+    if (
+        data.get("type") == "response_item"
+        and payload.get("type") == "message"
+        and payload.get("role") == "user"
+    ):
+        return _extract_codex_text(payload.get("content"))
+
+    if data.get("type") == "input_item":
+        return _extract_codex_text(payload.get("content"))
+
+    if data.get("type") == "event_msg" and payload.get("type") == "user_message":
+        text = _first_str(payload.get("message"))
+        if text:
+            return text
+        return _extract_codex_text(payload.get("text_elements"))
+
+    return ""
+
+
+def _extract_codex_text(content: object) -> str:
+    """Extract plain text from Codex content blocks."""
+    if isinstance(content, str):
+        return content[:80]
+    if not isinstance(content, list):
+        return ""
+
+    parts: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        text = block.get("text")
+        if isinstance(text, str) and text:
+            parts.append(text)
+
+    return "".join(parts)[:80]
 
 
 def _scan_index_file(
@@ -251,7 +397,7 @@ async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-    sessions = scan_all_sessions()
+    sessions = scan_all_sessions(provider.capabilities.name)
     if not sessions:
         await safe_reply(update.message, "\u274c No past sessions found.")
         return

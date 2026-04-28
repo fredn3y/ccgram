@@ -357,6 +357,116 @@ class TestScanAllSessions:
         assert len(result) == 1
         assert result[0].summary == "Implement auth"
 
+    def test_codex_provider_scans_codex_sessions(self, tmp_path, monkeypatch) -> None:
+        codex_home = tmp_path / ".codex"
+        session_dir = codex_home / "sessions" / "2026" / "04" / "28"
+        session_dir.mkdir(parents=True)
+
+        project_dir = tmp_path / "myproj"
+        project_dir.mkdir()
+
+        jsonl = session_dir / "rollout-2026-04-28T10-00-00-test.jsonl"
+        jsonl.write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "type": "session_meta",
+                            "payload": {
+                                "id": "019dd39a-08a9-7722-be78-b5a6a34974cb",
+                                "cwd": str(project_dir),
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "response_item",
+                            "payload": {
+                                "type": "message",
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "input_text",
+                                        "text": "Pick up the mobile bridge work",
+                                    }
+                                ],
+                            },
+                        }
+                    ),
+                ]
+            )
+            + "\n"
+        )
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+        result = scan_all_sessions("codex")
+
+        assert len(result) == 1
+        assert result[0].session_id == "019dd39a-08a9-7722-be78-b5a6a34974cb"
+        assert result[0].cwd == str(project_dir)
+        assert result[0].summary == "Pick up the mobile bridge work"
+
+    def test_codex_provider_uses_event_message_summary(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        codex_home = tmp_path / ".codex"
+        session_dir = codex_home / "sessions" / "2026" / "04" / "28"
+        session_dir.mkdir(parents=True)
+
+        jsonl = session_dir / "rollout-2026-04-28T10-00-00-test.jsonl"
+        jsonl.write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "type": "session_meta",
+                            "payload": {
+                                "id": "019dd39a-08a9-7722-be78-b5a6a34974cb",
+                                "cwd": "/tmp/myproj",
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "event_msg",
+                            "payload": {
+                                "type": "user_message",
+                                "message": "Continue from desktop",
+                            },
+                        }
+                    ),
+                ]
+            )
+            + "\n"
+        )
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+        result = scan_all_sessions("codex")
+
+        assert len(result) == 1
+        assert result[0].summary == "Continue from desktop"
+
+    def test_codex_provider_skips_missing_meta(self, tmp_path, monkeypatch) -> None:
+        codex_home = tmp_path / ".codex"
+        session_dir = codex_home / "sessions" / "2026" / "04" / "28"
+        session_dir.mkdir(parents=True)
+        (session_dir / "broken.jsonl").write_text(
+            json.dumps(
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": "No metadata",
+                    },
+                }
+            )
+            + "\n"
+        )
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+        assert scan_all_sessions("codex") == []
+
 
 class TestBuildResumeKeyboard:
     def _sessions(self, count: int = 3) -> list[dict[str, str]]:
