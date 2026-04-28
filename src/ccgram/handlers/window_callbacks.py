@@ -15,6 +15,7 @@ from telegram import Bot, CallbackQuery, Chat, Update
 from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 
+from .. import window_query
 from ..session import session_manager
 from ..thread_router import thread_router
 from ..tmux_manager import send_to_window, tmux_manager
@@ -209,16 +210,18 @@ async def _handle_bind(
         thread_id=thread_id,
     )
 
-    try:
-        await context.bot.edit_forum_topic(
-            chat_id=thread_router.resolve_chat_id(user_id, thread_id),
-            message_thread_id=thread_id,
-            name=format_topic_name_for_mode(
-                display, session_manager.get_approval_mode(selected_wid)
-            ),
-        )
-    except TelegramError as e:
-        logger.debug("Failed to rename topic: %s", e)
+    provider_name = detected or window_query.get_window_provider(selected_wid)
+    if provider_name != "codex":
+        try:
+            await context.bot.edit_forum_topic(
+                chat_id=thread_router.resolve_chat_id(user_id, thread_id),
+                message_thread_id=thread_id,
+                name=format_topic_name_for_mode(
+                    display, session_manager.get_approval_mode(selected_wid)
+                ),
+            )
+        except TelegramError as e:
+            logger.debug("Failed to rename topic: %s", e)
 
     await safe_edit(
         query,

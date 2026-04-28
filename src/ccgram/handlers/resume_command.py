@@ -40,7 +40,7 @@ from .callback_data import CB_RESUME_CANCEL, CB_RESUME_PAGE, CB_RESUME_PICK
 from .callback_helpers import get_thread_id
 from .callback_registry import register
 from .message_sender import safe_edit, safe_reply
-from .topic_emoji import format_topic_name_for_mode
+from .topic_emoji import format_topic_name_for_mode, get_stored_topic_name
 from .user_state import RESUME_SESSIONS
 
 logger = structlog.get_logger()
@@ -59,6 +59,15 @@ class ResumeEntry:
     summary: str
     cwd: str
     transcript_path: str = ""
+
+
+def _stored_topic_name_for_query(query: CallbackQuery, thread_id: int) -> str | None:
+    """Return the user-created Telegram topic title for a callback topic."""
+    message = query.message
+    chat = message.chat if message else None
+    if not chat or chat.type not in ("group", "supergroup"):
+        return None
+    return get_stored_topic_name(chat.id, thread_id)
 
 
 def scan_all_sessions(provider_name: str | None = None) -> list[ResumeEntry]:
@@ -460,10 +469,11 @@ async def _create_resume_window(
     session_id: str,
     cwd: str,
     transcript_path: str = "",
-) -> tuple[bool, str, str, str]:
+    preferred_window_name: str | None = None,
+) -> tuple[bool, str, str, str, str]:
     """Unbind old window, create a new one with resume args.
 
-    Returns (success, message, window_name, window_id).
+    Returns (success, message, window_name, window_id, provider_name).
     """
     old_window_id = thread_router.get_window_for_thread(user_id, thread_id)
     if old_window_id:
@@ -485,8 +495,14 @@ async def _create_resume_window(
     launch_command = resolve_launch_command(
         provider.capabilities.name, approval_mode=approval_mode
     )
+    create_kwargs = {
+        "agent_args": launch_args,
+        "launch_command": launch_command,
+    }
+    if provider.capabilities.name == "codex" and preferred_window_name:
+        create_kwargs["window_name"] = preferred_window_name
     success, message, created_wname, created_wid = await tmux_manager.create_window(
-        cwd, agent_args=launch_args, launch_command=launch_command
+        cwd, **create_kwargs
     )
     if success:
         session_manager.set_window_origin(created_wid, CCGRAM_CREATED_WINDOW_ORIGIN)
@@ -511,7 +527,7 @@ async def _create_resume_window(
                 provider_name=provider.capabilities.name,
             )
 
-    return success, message, created_wname, created_wid
+    return success, message, created_wname, created_wid, provider.capabilities.name
 
 
 async def _handle_pick(
@@ -550,8 +566,15 @@ async def _handle_pick(
         await query.answer("Failed")
         return
 
-    success, message, created_wname, created_wid = await _create_resume_window(
-        user_id, thread_id, session_id, cwd, transcript_path
+    success, message, created_wname, created_wid, provider_name = (
+        await _create_resume_window(
+            user_id,
+            thread_id,
+            session_id,
+            cwd,
+            transcript_path,
+            preferred_window_name=_stored_topic_name_for_query(query, thread_id),
+        )
     )
     if not success:
         await safe_edit(query, f"\u274c {message}")
@@ -568,17 +591,18 @@ async def _handle_pick(
     if chat and chat.type in ("group", "supergroup"):
         thread_router.set_group_chat_id(user_id, thread_id, chat.id)
 
-    # Rename topic to match the window
-    try:
-        await context.bot.edit_forum_topic(
-            chat_id=thread_router.resolve_chat_id(user_id, thread_id),
-            message_thread_id=thread_id,
-            name=format_topic_name_for_mode(
-                created_wname, session_manager.get_approval_mode(created_wid)
-            ),
-        )
-    except TelegramError as e:
-        logger.debug("Failed to rename topic: %s", e)
+    # Rename topic to match the window for providers that benefit from lifecycle badges.
+    if provider_name != "codex":
+        try:
+            await context.bot.edit_forum_topic(
+                chat_id=thread_router.resolve_chat_id(user_id, thread_id),
+                message_thread_id=thread_id,
+                name=format_topic_name_for_mode(
+                    created_wname, session_manager.get_approval_mode(created_wid)
+                ),
+            )
+        except TelegramError as e:
+            logger.debug("Failed to rename topic: %s", e)
 
     summary_short = picked.get("summary", "")[:40]
     await safe_edit(

@@ -24,9 +24,45 @@ from ..tmux_manager import tmux_manager
 from ..window_state_store import CCGRAM_CREATED_WINDOW_ORIGIN
 from .message_sender import safe_reply
 from .polling_strategies import lifecycle_strategy
-from .topic_emoji import format_topic_name_for_mode
+from .topic_emoji import format_topic_name_for_mode, get_stored_topic_name
 
 logger = structlog.get_logger()
+
+
+def _restore_create_kwargs(
+    provider_name: str,
+    launch_args: str,
+    launch_command: str,
+    chat_id: int,
+    thread_id: int,
+) -> dict[str, str]:
+    kwargs = {
+        "agent_args": launch_args,
+        "launch_command": launch_command,
+    }
+    if provider_name == "codex":
+        stored_topic_name = get_stored_topic_name(chat_id, thread_id)
+        if stored_topic_name:
+            kwargs["window_name"] = stored_topic_name
+    return kwargs
+
+
+async def _maybe_rename_restored_topic(
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    thread_id: int,
+    window_name: str,
+    approval_mode: str,
+    provider_name: str,
+) -> None:
+    if provider_name == "codex":
+        return
+    with contextlib.suppress(TelegramError):
+        await context.bot.edit_forum_topic(
+            chat_id=thread_router.resolve_chat_id(user_id, thread_id),
+            message_thread_id=thread_id,
+            name=format_topic_name_for_mode(window_name, approval_mode),
+        )
 
 
 async def restore_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -75,7 +111,14 @@ async def restore_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     launch_args = provider.make_launch_args(use_continue=True)
 
     success, message, wname, wid = await tmux_manager.create_window(
-        cwd, agent_args=launch_args, launch_command=launch_command
+        cwd,
+        **_restore_create_kwargs(
+            provider.capabilities.name,
+            launch_args,
+            launch_command,
+            update.message.chat.id,
+            thread_id,
+        ),
     )
     if not success:
         await safe_reply(update.message, f"\u274c {message}")
@@ -91,12 +134,9 @@ async def restore_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if update.message.chat.type in ("group", "supergroup"):
         thread_router.set_group_chat_id(user_id, thread_id, update.message.chat.id)
 
-    with contextlib.suppress(TelegramError):
-        await context.bot.edit_forum_topic(
-            chat_id=thread_router.resolve_chat_id(user_id, thread_id),
-            message_thread_id=thread_id,
-            name=format_topic_name_for_mode(wname, approval_mode),
-        )
+    await _maybe_rename_restored_topic(
+        context, user_id, thread_id, wname, approval_mode, provider.capabilities.name
+    )
 
     await safe_reply(
         update.message, f"\u2705 {message}\n\nContinuing previous session."

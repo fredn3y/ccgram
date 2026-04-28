@@ -315,7 +315,11 @@ async def _forward_message(
     message: Message,
 ) -> None:
     """Forward a text message to the bound tmux window."""
-    await message.chat.send_action(ChatAction.TYPING)  # type: ignore[union-attr]
+    provider = get_provider_for_window(
+        window_id, provider_name=window_query.get_window_provider(window_id)
+    )
+    if provider.capabilities.name != "codex":
+        await message.chat.send_action(ChatAction.TYPING)  # type: ignore[union-attr]
     # Enqueue a status clear to actually delete the Telegram message
     # (clear_status_msg_info only clears the tracking dict, leaving a ghost)
     await enqueue_status_update(bot, user_id, window_id, None, thread_id)

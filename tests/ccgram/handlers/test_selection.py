@@ -1,6 +1,7 @@
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from telegram import InlineKeyboardMarkup
 
 from ccgram.handlers.callback_data import (
@@ -15,7 +16,15 @@ from ccgram.handlers.directory_callbacks import (
     _handle_provider_select,
     _try_install_messaging_skill,
 )
+from ccgram.handlers.topic_emoji import reset_all_state, update_stored_topic_name
 from ccgram.handlers.user_state import PENDING_THREAD_ID, PENDING_THREAD_TEXT
+
+
+@pytest.fixture(autouse=True)
+def _reset_topic_state():
+    reset_all_state()
+    yield
+    reset_all_state()
 
 
 class TestBuildProviderPicker:
@@ -265,6 +274,60 @@ class TestHandleModeSelect:
         mock_sm.set_window_provider.assert_called_once_with("@5", "codex")
         mock_sm.set_window_approval_mode.assert_called_once_with("@5", "yolo")
         mock_tr.set_group_chat_id.assert_called_once_with(100, 42, -100999)
+
+    @patch("ccgram.providers.resolve_launch_command")
+    @patch("ccgram.handlers.directory_callbacks.safe_edit", new_callable=AsyncMock)
+    @patch("ccgram.handlers.directory_callbacks.session_manager")
+    @patch("ccgram.handlers.directory_callbacks.tmux_manager")
+    @patch("ccgram.handlers.directory_callbacks.provider_registry")
+    @patch("ccgram.handlers.directory_callbacks.thread_router")
+    async def test_codex_uses_created_topic_title_as_window_name(
+        self,
+        mock_tr: MagicMock,
+        mock_registry: MagicMock,
+        mock_tmux: MagicMock,
+        mock_sm: MagicMock,
+        mock_edit: AsyncMock,
+        mock_resolve_launch: MagicMock,
+    ) -> None:
+        mock_registry.is_valid.return_value = True
+        mock_provider = MagicMock()
+        mock_provider.capabilities.name = "codex"
+        mock_provider.capabilities.supports_hook = False
+        mock_provider.capabilities.has_yolo_confirmation = False
+        mock_provider.capabilities.chat_first_command_path = False
+        mock_registry.get.return_value = mock_provider
+
+        mock_resolve_launch.return_value = "codex"
+        mock_tmux.create_window = AsyncMock(
+            return_value=(True, "Created window 'chat-title'", "chat-title", "@5")
+        )
+        mock_tmux.stamp_pane_title = AsyncMock()
+        mock_tr.get_window_for_thread.return_value = None
+        mock_tr.resolve_chat_id.return_value = -100999
+        mock_sm.send_to_window = AsyncMock(return_value=(True, "ok"))
+        mock_sm.get_window_state.return_value = MagicMock()
+
+        update_stored_topic_name(-100999, 42, "Second brain stock idea")
+        user_data = {"browse_path": "/tmp/proj", PENDING_THREAD_ID: 42}
+        query = _make_query(data=f"{CB_MODE_SELECT}codex:normal")
+        update = _make_update(thread_id=42)
+        context = _make_context(user_data)
+
+        await _handle_mode_select(
+            query, 100, f"{CB_MODE_SELECT}codex:normal", update, context
+        )
+
+        mock_tmux.create_window.assert_called_once_with(
+            "/tmp/proj",
+            launch_command="codex",
+            window_name="Second brain stock idea",
+        )
+        context.bot.edit_forum_topic.assert_not_called()
+        mock_tr.bind_thread.assert_called_once_with(
+            100, 42, "@5", window_name="chat-title"
+        )
+        mock_edit.assert_called()
 
     @patch(
         "ccgram.handlers.directory_callbacks._accept_yolo_confirmation",

@@ -546,6 +546,21 @@ async def _handle_clear_command(
     reset_window_polling_state(window_id)
 
 
+async def _send_command_typing_action(
+    update: Update, thread_id: int | None, provider_name: str
+) -> None:
+    """Show Telegram typing while command output is pending, except for Codex."""
+    if provider_name == "codex":
+        return
+    if not update.message:
+        return
+    await update.message.get_bot().send_chat_action(
+        chat_id=update.message.chat.id,
+        message_thread_id=thread_id,
+        action=ChatAction.TYPING,
+    )
+
+
 # --- Main command handler ---
 
 
@@ -615,11 +630,7 @@ async def forward_command_handler(
     logger.info(
         "Forwarding command %s to window %s (user=%d)", cc_slash, display, user.id
     )
-    await update.message.get_bot().send_chat_action(
-        chat_id=update.message.chat.id,
-        message_thread_id=thread_id,
-        action=ChatAction.TYPING,
-    )
+    await _send_command_typing_action(update, thread_id, provider.capabilities.name)
     (
         probe_transcript_path,
         probe_transcript_offset,

@@ -55,7 +55,7 @@ from .directory_browser import (
 )
 from .callback_registry import register
 from .message_sender import safe_edit, safe_send
-from .topic_emoji import format_topic_name_for_mode
+from .topic_emoji import format_topic_name_for_mode, get_stored_topic_name
 from .user_state import PENDING_THREAD_ID, PENDING_THREAD_TEXT
 
 logger = structlog.get_logger()
@@ -526,6 +526,53 @@ def _try_install_messaging_skill(provider_name: str, cwd: str) -> None:
         logger.exception("Failed to install messaging skill at %s", cwd)
 
 
+def _get_callback_chat(query: CallbackQuery):
+    message = query.message
+    return message.chat if message else None
+
+
+def _stored_topic_name_for_pending_thread(
+    query: CallbackQuery, pending_thread_id: int | None
+) -> str | None:
+    chat = _get_callback_chat(query)
+    if (
+        pending_thread_id is None
+        or not chat
+        or chat.type not in ("group", "supergroup")
+    ):
+        return None
+    return get_stored_topic_name(chat.id, pending_thread_id)
+
+
+def _create_window_kwargs(
+    provider_name: str, launch_command: str, stored_topic_name: str | None
+) -> dict[str, str]:
+    kwargs = {"launch_command": launch_command}
+    if provider_name == "codex" and stored_topic_name:
+        kwargs["window_name"] = stored_topic_name
+    return kwargs
+
+
+async def _maybe_rename_bound_topic(
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    thread_id: int,
+    window_name: str,
+    approval_mode: str,
+    provider_name: str,
+) -> None:
+    if provider_name == "codex":
+        return
+    try:
+        await context.bot.edit_forum_topic(
+            chat_id=thread_router.resolve_chat_id(user_id, thread_id),
+            message_thread_id=thread_id,
+            name=format_topic_name_for_mode(window_name, approval_mode),
+        )
+    except TelegramError as e:
+        logger.debug("Failed to rename topic: %s", e)
+
+
 async def _create_window_and_bind(
     query: CallbackQuery,
     user_id: int,
@@ -544,11 +591,13 @@ async def _create_window_and_bind(
     pending_thread_id: int | None = (
         context.user_data.get(PENDING_THREAD_ID) if context.user_data else None
     )
+    chat = _get_callback_chat(query)
+    stored_topic_name = _stored_topic_name_for_pending_thread(query, pending_thread_id)
 
     launch_command = resolve_launch_command(provider_name, approval_mode=approval_mode)
-
     success, message, created_wname, created_wid = await tmux_manager.create_window(
-        selected_path, launch_command=launch_command
+        selected_path,
+        **_create_window_kwargs(provider_name, launch_command, stored_topic_name),
     )
     if not success:
         await safe_edit(query, f"❌ {message}")
@@ -587,8 +636,6 @@ async def _create_window_and_bind(
         thread_router.bind_thread(
             user_id, pending_thread_id, created_wid, window_name=created_wname
         )
-        query_message = query.message
-        chat = query_message.chat if query_message else None
         if chat and chat.type in ("group", "supergroup"):
             thread_router.set_group_chat_id(user_id, pending_thread_id, chat.id)
 
@@ -603,14 +650,14 @@ async def _create_window_and_bind(
         await safe_edit(query, f"✅ {message}")
         return
 
-    try:
-        await context.bot.edit_forum_topic(
-            chat_id=thread_router.resolve_chat_id(user_id, pending_thread_id),
-            message_thread_id=pending_thread_id,
-            name=format_topic_name_for_mode(created_wname, approval_mode),
-        )
-    except TelegramError as e:
-        logger.debug("Failed to rename topic: %s", e)
+    await _maybe_rename_bound_topic(
+        context,
+        user_id,
+        pending_thread_id,
+        created_wname,
+        approval_mode,
+        provider.capabilities.name,
+    )
 
     await safe_edit(
         query,

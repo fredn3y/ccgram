@@ -13,6 +13,7 @@ from ccgram.handlers.resume_command import (
     resume_command,
     scan_all_sessions,
 )
+from ccgram.handlers.topic_emoji import reset_all_state, update_stored_topic_name
 from ccgram.handlers.user_state import RESUME_SESSIONS
 
 _RC = "ccgram.handlers.resume_command"
@@ -750,6 +751,67 @@ class TestResumePickCallback:
         mock_tr.bind_thread.assert_called_once_with(
             100, 42, "@5", window_name="project"
         )
+
+    @patch(f"{_RC}.tmux_manager")
+    @patch(f"{_RC}.thread_router")
+    @patch(f"{_RC}.session_map_sync")
+    @patch(f"{_RC}.session_manager")
+    @patch(f"{_RC}.safe_edit", new_callable=AsyncMock)
+    @patch(f"{_RC}.get_thread_id", return_value=42)
+    async def test_codex_pick_uses_topic_title_without_renaming_topic(
+        self,
+        _mock_thread_id: MagicMock,
+        _mock_safe_edit: AsyncMock,
+        mock_sm: MagicMock,
+        mock_sms: MagicMock,
+        mock_tr: MagicMock,
+        mock_tm: MagicMock,
+    ) -> None:
+        mock_provider = MagicMock()
+        mock_provider.capabilities.supports_hook = False
+        mock_provider.capabilities.name = "codex"
+        mock_provider.make_launch_args.return_value = "--resume sess-1"
+        mock_sm.view_window.return_value = None
+        mock_tr.get_window_for_thread.return_value = None
+        mock_tm.create_window = AsyncMock(
+            return_value=(True, "Window created", "Topic title", "@5")
+        )
+        mock_tr.resolve_chat_id.return_value = -100999
+
+        update = _make_callback_update(data=f"{CB_RESUME_PICK}0")
+        user_data: dict = {
+            RESUME_SESSIONS: [
+                {
+                    "session_id": "sess-1",
+                    "summary": "Fix bug",
+                    "cwd": "/tmp/proj",
+                    "transcript_path": "/tmp/session.jsonl",
+                },
+            ],
+        }
+        ctx = _make_context(user_data)
+        query = update.callback_query
+        reset_all_state()
+        update_stored_topic_name(-100999, 42, "Topic title")
+
+        try:
+            with (
+                patch(f"{_RC}.Path") as mock_path,
+                patch(f"{_RC}.get_provider", return_value=mock_provider),
+            ):
+                mock_path.return_value.is_dir.return_value = True
+                await handle_resume_command_callback(query, 100, query.data, update, ctx)
+        finally:
+            reset_all_state()
+
+        mock_tm.create_window.assert_called_once_with(
+            "/tmp/proj",
+            agent_args="--resume sess-1",
+            launch_command=ANY,
+            window_name="Topic title",
+        )
+        ctx.bot.edit_forum_topic.assert_not_called()
+        mock_sms.register_hookless_session.assert_called_once()
 
     @patch(f"{_RC}.tmux_manager")
     @patch(f"{_RC}.thread_router")

@@ -342,6 +342,11 @@ def update_stored_topic_name(chat_id: int, thread_id: int, new_clean_name: str) 
     _topic_names[(chat_id, thread_id)] = new_clean_name
 
 
+def get_stored_topic_name(chat_id: int, thread_id: int) -> str | None:
+    """Return the clean topic title captured from Telegram, if known."""
+    return _topic_names.get((chat_id, thread_id))
+
+
 @topic_state.register("chat")
 def clear_topic_emoji_state(chat_id: int, thread_id: int) -> None:
     """Clear emoji tracking for a topic (called on topic cleanup)."""

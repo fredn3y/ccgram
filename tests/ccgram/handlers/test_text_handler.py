@@ -353,6 +353,26 @@ class TestForwardMessage:
 
         mock_send.assert_called_once_with("@0", "hello")
 
+    @patch(f"{_TH}.get_provider_for_window")
+    @patch(f"{_TH}.send_to_window", new_callable=AsyncMock, return_value=(True, "ok"))
+    @patch(f"{_TH}.window_query")
+    async def test_codex_does_not_send_typing_action(
+        self,
+        mock_sm: MagicMock,
+        _mock_send: AsyncMock,
+        mock_get_provider: MagicMock,
+    ) -> None:
+        bot = AsyncMock()
+        message = AsyncMock()
+        provider = MagicMock()
+        provider.capabilities.name = "codex"
+        mock_get_provider.return_value = provider
+
+        with patch(f"{_TH}.get_interactive_window", return_value=None):
+            await _forward_message("@0", 100, 42, "hello", bot, message)
+
+        message.chat.send_action.assert_not_called()
+
     @patch(f"{_TH}.safe_reply", new_callable=AsyncMock)
     @patch(
         f"{_TH}.send_to_window",

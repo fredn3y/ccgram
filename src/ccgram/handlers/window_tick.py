@@ -67,6 +67,34 @@ def _get_provider(window_id: str) -> "AgentProvider":
     )
 
 
+def _is_quiet_codex_window(window_id: str) -> bool:
+    """Return True for Codex windows where Telegram status chatter is noisy."""
+    return _get_provider(window_id).capabilities.name == "codex"
+
+
+async def _maybe_send_typing(
+    bot: Bot, user_id: int, thread_id: int | None, window_id: str
+) -> None:
+    """Send Telegram typing only for providers where it is useful signal."""
+    if _is_quiet_codex_window(window_id):
+        return
+    await _send_typing_throttled(bot, user_id, thread_id)
+
+
+async def _maybe_update_topic_emoji(
+    bot: Bot,
+    chat_id: int,
+    thread_id: int,
+    state: str,
+    display: str,
+    window_id: str,
+) -> None:
+    """Update lifecycle badges except for Codex's frequent active/idle churn."""
+    if _is_quiet_codex_window(window_id) and state in {"active", "idle", "done"}:
+        return
+    await update_topic_emoji(bot, chat_id, thread_id, state, display)
+
+
 # ── Typing throttle ─────────────────────────────────────────────────────
 
 
@@ -110,10 +138,12 @@ async def _transition_to_idle(
     notif_mode: str,
 ) -> None:
     terminal_poll_state.cancel_startup_timer(window_id)
-    await update_topic_emoji(bot, chat_id, thread_id, "idle", display)
+    await _maybe_update_topic_emoji(bot, chat_id, thread_id, "idle", display, window_id)
     lifecycle_strategy.clear_autoclose_timer(user_id, thread_id)
     lifecycle_strategy.clear_typing_state(user_id, thread_id)
-    if notif_mode not in ("muted", "errors_only"):
+    if notif_mode not in ("muted", "errors_only") and not _is_quiet_codex_window(
+        window_id
+    ):
         from .callback_data import IDLE_STATUS_TEXT
 
         await enqueue_status_update(
@@ -405,8 +435,10 @@ async def _apply_active_transition(
         claude_task_state.clear_wait_header(window_id)
         claude_task_state.set_last_status(window_id, decision.status_text or "")
         terminal_poll_state.mark_seen_status(window_id)
-        await _send_typing_throttled(bot, user_id, thread_id)
-        if notif_mode not in ("muted", "errors_only"):
+        await _maybe_send_typing(bot, user_id, thread_id, window_id)
+        if notif_mode not in ("muted", "errors_only") and not _is_quiet_codex_window(
+            window_id
+        ):
             from ..claude_task_state import build_subagent_label, get_subagent_names
 
             subagent_names = get_subagent_names(window_id)
@@ -419,11 +451,13 @@ async def _apply_active_transition(
             )
     else:
         claude_task_state.clear_wait_header(window_id)
-        await _send_typing_throttled(bot, user_id, thread_id)
+        await _maybe_send_typing(bot, user_id, thread_id, window_id)
     if thread_id is not None:
         chat_id = thread_router.resolve_chat_id(user_id, thread_id)
         display = thread_router.get_display_name(window_id)
-        await update_topic_emoji(bot, chat_id, thread_id, "active", display)
+        await _maybe_update_topic_emoji(
+            bot, chat_id, thread_id, "active", display, window_id
+        )
         lifecycle_strategy.clear_autoclose_timer(user_id, thread_id)
 
 
@@ -438,7 +472,7 @@ async def _apply_done_transition(
     chat_id = thread_router.resolve_chat_id(user_id, thread_id)
     display = thread_router.get_display_name(window_id)
     terminal_poll_state.cancel_startup_timer(window_id)
-    await update_topic_emoji(bot, chat_id, thread_id, "done", display)
+    await _maybe_update_topic_emoji(bot, chat_id, thread_id, "done", display, window_id)
     lifecycle_strategy.start_autoclose_timer(
         user_id, thread_id, "done", time.monotonic()
     )
@@ -457,11 +491,13 @@ async def _apply_starting_transition(
     ws = terminal_poll_state.peek_state(window_id)
     if ws is None or ws.startup_time is None:
         terminal_poll_state.begin_startup_timer(window_id, time.monotonic())
-    await _send_typing_throttled(bot, user_id, thread_id)
+    await _maybe_send_typing(bot, user_id, thread_id, window_id)
     if thread_id is not None:
         chat_id = thread_router.resolve_chat_id(user_id, thread_id)
         display = thread_router.get_display_name(window_id)
-        await update_topic_emoji(bot, chat_id, thread_id, "active", display)
+        await _maybe_update_topic_emoji(
+            bot, chat_id, thread_id, "active", display, window_id
+        )
         lifecycle_strategy.clear_autoclose_timer(user_id, thread_id)
 
 

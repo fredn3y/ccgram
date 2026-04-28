@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from ccgram.handlers.topic_emoji import reset_all_state
+from ccgram.handlers.topic_emoji import get_stored_topic_name, reset_all_state
 
 
 @pytest.fixture(autouse=True)
@@ -23,6 +23,18 @@ def _make_update(
     update.effective_chat.id = chat_id
     update.message.forum_topic_edited.name = new_name
     update.message.forum_topic_edited.icon_custom_emoji_id = None
+    update.message.message_thread_id = thread_id
+    return update
+
+
+def _make_created_update(
+    name: str, thread_id: int = 42, chat_id: int = -100, user_id: int = 1
+) -> MagicMock:
+    """Create a mock Update for FORUM_TOPIC_CREATED."""
+    update = MagicMock()
+    update.effective_user.id = user_id
+    update.effective_chat.id = chat_id
+    update.message.forum_topic_created.name = name
     update.message.message_thread_id = thread_id
     return update
 
@@ -141,3 +153,25 @@ class TestTopicEditedHandler:
 
         assert _topic_names[(-100, 42)] == "old-name"
         mock_tr.set_display_name.assert_not_called()
+
+
+class TestTopicCreatedHandler:
+    @_PATCH_ALLOWED
+    async def test_stores_user_created_topic_title(self, _allowed: MagicMock) -> None:
+        from ccgram.handlers.topic_lifecycle import topic_created_handler
+
+        update = _make_created_update("Second brain stock idea")
+        await topic_created_handler(update, MagicMock())
+
+        assert get_stored_topic_name(-100, 42) == "Second brain stock idea"
+
+    @_PATCH_ALLOWED
+    async def test_strips_lifecycle_badge_from_created_topic(
+        self, _allowed: MagicMock
+    ) -> None:
+        from ccgram.handlers.topic_lifecycle import topic_created_handler
+
+        update = _make_created_update("\U0001f7e2 Existing title")
+        await topic_created_handler(update, MagicMock())
+
+        assert get_stored_topic_name(-100, 42) == "Existing title"

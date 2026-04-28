@@ -40,7 +40,7 @@ from .callback_data import (
 from .callback_helpers import get_thread_id
 from .callback_registry import register
 from .message_sender import safe_edit, safe_send
-from .topic_emoji import format_topic_name_for_mode
+from .topic_emoji import format_topic_name_for_mode, get_stored_topic_name
 from .user_state import (
     PENDING_THREAD_ID,
     PENDING_THREAD_TEXT,
@@ -369,8 +369,21 @@ async def _create_and_bind_window(
         provider.capabilities.name, approval_mode=approval_mode
     )
 
+    chat = query.message.chat if query.message else None
+    create_kwargs = {
+        "agent_args": agent_args,
+        "launch_command": launch_command,
+    }
+    if (
+        provider.capabilities.name == "codex"
+        and chat
+        and chat.type in ("group", "supergroup")
+    ):
+        stored_topic_name = get_stored_topic_name(chat.id, thread_id)
+        if stored_topic_name:
+            create_kwargs["window_name"] = stored_topic_name
     success, message, created_wname, created_wid = await tmux_manager.create_window(
-        cwd, agent_args=agent_args, launch_command=launch_command
+        cwd, **create_kwargs
     )
     if not success:
         await safe_edit(query, f"\u274c {message}")
@@ -390,18 +403,18 @@ async def _create_and_bind_window(
     thread_router.bind_thread(
         user_id, thread_id, created_wid, window_name=created_wname
     )
-    chat = query.message.chat if query.message else None
     if chat and chat.type in ("group", "supergroup"):
         thread_router.set_group_chat_id(user_id, thread_id, chat.id)
 
-    try:
-        await context.bot.edit_forum_topic(
-            chat_id=thread_router.resolve_chat_id(user_id, thread_id),
-            message_thread_id=thread_id,
-            name=format_topic_name_for_mode(created_wname, approval_mode),
-        )
-    except TelegramError as e:
-        logger.debug("Failed to rename topic: %s", e)
+    if provider.capabilities.name != "codex":
+        try:
+            await context.bot.edit_forum_topic(
+                chat_id=thread_router.resolve_chat_id(user_id, thread_id),
+                message_thread_id=thread_id,
+                name=format_topic_name_for_mode(created_wname, approval_mode),
+            )
+        except TelegramError as e:
+            logger.debug("Failed to rename topic: %s", e)
 
     await safe_edit(query, f"\u2705 {message}\n\n{success_label}")
 

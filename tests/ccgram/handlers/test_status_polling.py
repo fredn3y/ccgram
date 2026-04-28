@@ -622,6 +622,24 @@ class TestTransitionToIdle:
             await _transition_to_idle(bot, 1, "@0", 42, -100, "project", mode)
         mock_enqueue.assert_called_once_with(bot, 1, "@0", None, thread_id=42)
 
+    async def test_codex_idle_clears_status_without_ready_text(self) -> None:
+        from ccgram.handlers.window_tick import _transition_to_idle
+
+        bot = AsyncMock(spec=Bot)
+        provider = MagicMock()
+        provider.capabilities.name = "codex"
+        with (
+            patch(
+                "ccgram.handlers.window_tick._get_provider", return_value=provider
+            ),
+            patch("ccgram.handlers.window_tick.update_topic_emoji") as mock_emoji,
+            patch("ccgram.handlers.window_tick.enqueue_status_update") as mock_enqueue,
+        ):
+            await _transition_to_idle(bot, 1, "@0", 42, -100, "project", "normal")
+
+        mock_emoji.assert_not_called()
+        mock_enqueue.assert_called_once_with(bot, 1, "@0", None, thread_id=42)
+
 
 class TestShellPromptClearsStatus:
     def test_shell_prompt_with_hook_yields_done(self) -> None:

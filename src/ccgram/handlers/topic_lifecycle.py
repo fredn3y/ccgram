@@ -227,6 +227,29 @@ async def probe_topic_existence(bot: Bot) -> None:
 # ------------------------------------------------------------------
 
 
+async def topic_created_handler(
+    update: Update, _context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Remember a user-created topic title before it is bound to a window."""
+    user = update.effective_user
+    if not user or not config.is_user_allowed(user.id):
+        return
+    if not update.message or not update.message.forum_topic_created:
+        return
+
+    from .callback_helpers import get_thread_id
+    from .topic_emoji import strip_emoji_prefix, update_stored_topic_name
+
+    thread_id = get_thread_id(update)
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    if thread_id is None or chat_id is None:
+        return
+
+    name = update.message.forum_topic_created.name
+    if name:
+        update_stored_topic_name(chat_id, thread_id, strip_emoji_prefix(name))
+
+
 async def topic_closed_handler(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
