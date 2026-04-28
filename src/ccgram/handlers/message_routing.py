@@ -54,6 +54,13 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:  # noqa: C901, 
         logger.info("No active users for session %s", msg.session_id)
         return
 
+    if msg.role == "user":
+        logger.debug(
+            "Skipping user transcript echo for session %s",
+            msg.session_id,
+        )
+        return
+
     for user_id, window_id, thread_id in active_users:
         structlog.contextvars.clear_contextvars()
         structlog.contextvars.bind_contextvars(

@@ -86,6 +86,12 @@ async def test_no_active_users_returns_early(bot, mock_deps):
     mock_deps["eq"].assert_not_called()
 
 
+async def test_user_transcript_echo_is_not_relayed(bot, mock_deps):
+    await handle_new_message(_make_msg(text="say hello", role="user"), bot)
+    mock_deps["brp"].assert_not_called()
+    mock_deps["eq"].assert_not_called()
+
+
 async def test_muted_mode_skips_non_tool(bot, mock_deps):
     mock_deps["wq"].get_notification_mode.return_value = "muted"
     await handle_new_message(_make_msg(text="hi"), bot)
