@@ -18,6 +18,7 @@ from ..codex_app_server import (
     submit_turn_to_app_server,
 )
 from ..config import config
+from ..session import session_manager
 from ..thread_router import thread_router
 from ..telegram_sender import split_message
 from ..utils import atomic_write_json, task_done_callback
@@ -32,7 +33,7 @@ _state_lock = asyncio.Lock()
 
 @dataclass(frozen=True, slots=True)
 class PendingCodexTopic:
-    """A Telegram topic that represents a Codex session not yet running in tmux."""
+    """A Telegram topic that mirrors a Codex app-server session."""
 
     session_id: str
     summary: str
@@ -206,8 +207,12 @@ async def sync_codex_history_once(bot: Bot) -> None:
             await _sync_pending_history(bot, state)
 
         if not sessions:
+            _sync_bound_codex_topics(state, {}, target)
             _save_state(state)
             return
+
+        sessions_by_id = {entry.session_id: entry for entry in sessions}
+        _sync_bound_codex_topics(state, sessions_by_id, target)
 
         session_ids = {entry.session_id for entry in sessions}
         if not state.initialized:
@@ -261,6 +266,70 @@ def _new_session_candidates(
             continue
         candidates.append(entry)
     return candidates
+
+
+def _sync_bound_codex_topics(
+    state: CodexHistoryState,
+    sessions_by_id: dict[str, ResumeEntry],
+    target: _SyncTarget,
+) -> None:
+    """Record existing bound Codex topics as app-server-synced topics."""
+    for user_id, thread_id, window_id in thread_router.iter_thread_bindings():
+        key = _topic_key(user_id, thread_id)
+        if key in state.pending_topics:
+            continue
+
+        view = session_manager.view_window(window_id)
+        if view is None or not view.session_id:
+            continue
+
+        provider_name = (view.provider_name or "").lower()
+        transcript_path = str(view.transcript_path or "")
+        if provider_name and provider_name != "codex":
+            continue
+        if not provider_name and ".codex/sessions/" not in transcript_path:
+            continue
+
+        entry = sessions_by_id.get(view.session_id)
+        cwd = view.cwd or (entry.cwd if entry else "")
+        if not cwd or not Path(cwd).is_dir():
+            continue
+
+        transcript_path = transcript_path or (entry.transcript_path if entry else "")
+        if not transcript_path:
+            continue
+
+        chat_id = thread_router.resolve_chat_id(user_id, thread_id)
+        if chat_id == user_id and user_id == target.user_id:
+            chat_id = target.chat_id
+        topic_name = thread_router.get_display_name(window_id)
+        summary = (entry.summary if entry else "") or topic_name
+        state.pending_topics[key] = PendingCodexTopic(
+            session_id=view.session_id,
+            summary=summary,
+            cwd=cwd,
+            transcript_path=transcript_path,
+            user_id=user_id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            topic_name=topic_name,
+            created_at=time.time(),
+            history_offset=_transcript_size(transcript_path),
+            app_server_thread_id=view.session_id,
+        )
+        state.seen_session_ids.add(view.session_id)
+        logger.info(
+            "Synced existing Codex topic %d to app-server thread %s",
+            thread_id,
+            view.session_id,
+        )
+
+
+def _transcript_size(transcript_path: str) -> int:
+    try:
+        return Path(transcript_path).stat().st_size
+    except OSError:
+        return 0
 
 
 def _has_user_summary(entry: ResumeEntry) -> bool:
@@ -447,6 +516,7 @@ async def submit_or_activate_pending_codex_topic(
     thread_id: int,
     chat_id: int,
     text: str,
+    fallback_window_id: str | None = None,
 ) -> PendingCodexAction:
     """Submit to app-server for pending Codex topics, falling back to tmux resume."""
     async with _state_lock:
@@ -477,6 +547,12 @@ async def submit_or_activate_pending_codex_topic(
                 thread_id,
                 exc,
             )
+            if fallback_window_id:
+                thread_router.set_group_chat_id(user_id, thread_id, chat_id)
+                return PendingCodexAction(
+                    "fallback_window",
+                    window_id=fallback_window_id,
+                )
         else:
             await _mark_pending_topic_submitted(
                 pending,
@@ -486,6 +562,10 @@ async def submit_or_activate_pending_codex_topic(
                 text,
             )
             return PendingCodexAction("submitted", message=submission.turn_id)
+
+    if fallback_window_id:
+        thread_router.set_group_chat_id(user_id, thread_id, chat_id)
+        return PendingCodexAction("fallback_window", window_id=fallback_window_id)
 
     window_id = await activate_pending_codex_topic(user_id, thread_id, chat_id)
     if window_id is None:

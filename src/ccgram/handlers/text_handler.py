@@ -364,13 +364,15 @@ async def _handle_pending_codex_topic(
     text: str,
     bot: Bot,
     message: Message,
+    fallback_window_id: str | None = None,
 ) -> tuple[bool, str | None]:
-    """Handle pending Codex Desktop topics before generic unbound routing."""
+    """Handle app-server-synced Codex topics before tmux routing."""
     pending_action = await submit_or_activate_pending_codex_topic(
         user_id,
         thread_id,
         chat_id,
         text,
+        fallback_window_id=fallback_window_id,
     )
     if pending_action.status == "submitted":
         await ack_reaction(bot, message.chat.id, message.message_id)
@@ -427,21 +429,28 @@ async def handle_text_message(
             )
         return
 
-    # Unbound topic — show picker or browser
+    # App-server-synced Codex topic — prefer Desktop thread routing.
     window_id = thread_router.get_window_for_thread(user.id, thread_id)
-    if window_id is None:
-        handled, window_id = await _handle_pending_codex_topic(
-            user.id,
-            thread_id,
-            chat.id,
-            text,
-            context.bot,
-            message,
-        )
-        if handled:
-            return
+    handled, pending_window_id = await _handle_pending_codex_topic(
+        user.id,
+        thread_id,
+        chat.id,
+        text,
+        context.bot,
+        message,
+        fallback_window_id=window_id,
+    )
+    if handled:
+        return
+    window_id = pending_window_id or window_id
+
+    # Unbound topic — show picker or browser
     if window_id is None and await _handle_unbound_topic(
-        user.id, thread_id, text, context.user_data, message
+        user.id,
+        thread_id,
+        text,
+        context.user_data,
+        message,
     ):
         return
 

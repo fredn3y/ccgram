@@ -121,6 +121,49 @@ async def test_scan_marks_bound_sessions_seen_without_duplicate_topic(tmp_path) 
     assert state.seen_session_ids == {"sess-bound"}
 
 
+async def test_scan_records_existing_bound_codex_topic_for_app_server_sync(
+    tmp_path,
+) -> None:
+    cwd = tmp_path / "second-brain"
+    cwd.mkdir()
+    transcript = tmp_path / "bound.jsonl"
+    _write_transcript(
+        transcript,
+        '{"type":"event_msg","payload":{"type":"user_message","message":"old chat"}}',
+    )
+    entry = ResumeEntry("sess-bound", "old chat", str(cwd), str(transcript))
+    bot = _bot()
+    view = SimpleNamespace(
+        session_id="sess-bound",
+        provider_name="codex",
+        transcript_path=transcript,
+        cwd=str(cwd),
+    )
+
+    with (
+        patch(f"{_CHS}.config", _config(tmp_path)),
+        patch(f"{_CHS}.thread_router") as mock_tr,
+        patch(f"{_CHS}.session_manager") as mock_sm,
+        patch(f"{_CHS}._bound_session_ids", return_value={"sess-bound"}),
+        patch(f"{_CHS}.scan_all_sessions", return_value=[entry]),
+    ):
+        mock_tr.iter_thread_bindings.return_value = [(100, 166, "@11")]
+        mock_tr.resolve_chat_id.return_value = -100999
+        mock_tr.get_display_name.return_value = "old desktop thread"
+        mock_sm.view_window.return_value = view
+        _save_state(CodexHistoryState(True, set(), {}))
+        await sync_codex_history_once(bot)
+        state = _load_state()
+
+    bot.create_forum_topic.assert_not_awaited()
+    pending = state.pending_topics["100:166"]
+    assert pending.session_id == "sess-bound"
+    assert pending.thread_id == 166
+    assert pending.app_server_thread_id == "sess-bound"
+    assert pending.history_offset == transcript.stat().st_size
+    assert state.seen_session_ids == {"sess-bound"}
+
+
 async def test_pending_topic_backfills_later_agent_message(tmp_path) -> None:
     transcript = tmp_path / "session.jsonl"
     user_line = (
@@ -483,3 +526,44 @@ async def test_pending_topic_app_server_failure_falls_back_to_tmux(tmp_path) -> 
     mock_create.assert_awaited_once()
     mock_tr.bind_thread.assert_called_once()
     assert state.pending_topics == {}
+
+
+async def test_pending_bound_topic_app_server_failure_uses_existing_window(
+    tmp_path,
+) -> None:
+    pending = PendingCodexTopic(
+        session_id="sess-1",
+        summary="reply hello",
+        cwd="/tmp/project",
+        transcript_path="/tmp/session.jsonl",
+        user_id=100,
+        chat_id=-100999,
+        thread_id=77,
+        topic_name="reply hello - project",
+        created_at=1.0,
+        app_server_thread_id="thread-1",
+    )
+
+    with (
+        patch(f"{_CHS}.config", _config(tmp_path)),
+        patch(f"{_CHS}.thread_router") as mock_tr,
+        patch(f"{_CHS}._create_resume_window", new=AsyncMock()) as mock_create,
+        patch(f"{_CHS}.submit_turn_to_app_server", new=AsyncMock()) as mock_submit,
+    ):
+        mock_submit.side_effect = CodexAppServerError("offline")
+        _save_state(CodexHistoryState(True, {"sess-1"}, {"100:77": pending}))
+
+        action = await submit_or_activate_pending_codex_topic(
+            100,
+            77,
+            -100999,
+            "continue from mobile",
+            fallback_window_id="@11",
+        )
+        state = _load_state()
+
+    assert action.status == "fallback_window"
+    assert action.window_id == "@11"
+    mock_create.assert_not_awaited()
+    mock_tr.set_group_chat_id.assert_called_once_with(100, 77, -100999)
+    assert state.pending_topics["100:77"] == pending
