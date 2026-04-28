@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 from dataclasses import dataclass
 from typing import Any
 
@@ -15,6 +16,9 @@ from websockets.asyncio.client import connect
 from websockets.exceptions import WebSocketException
 
 from . import __version__
+
+_OVERLOADED_ERROR_CODE = -32001
+_OVERLOADED_RETRIES = 3
 
 
 class CodexAppServerError(Exception):
@@ -110,14 +114,26 @@ class CodexAppServerClient:
         await self._send(payload)
 
     async def _request(self, method: str, params: dict[str, Any] | None) -> Any:
-        request_id = self._next_id
-        self._next_id += 1
-        payload: dict[str, Any] = {"id": request_id, "method": method}
-        if params is not None:
-            payload["params"] = params
+        for attempt in range(_OVERLOADED_RETRIES + 1):
+            request_id = self._next_id
+            self._next_id += 1
+            payload: dict[str, Any] = {"id": request_id, "method": method}
+            if params is not None:
+                payload["params"] = params
 
-        await self._send(payload)
-        return await self._recv_response(request_id)
+            await self._send(payload)
+            try:
+                return await self._recv_response(request_id)
+            except CodexAppServerRequestError as exc:
+                if exc.code != _OVERLOADED_ERROR_CODE or attempt >= _OVERLOADED_RETRIES:
+                    raise
+                await self._sleep_before_overload_retry(attempt)
+        raise CodexAppServerProtocolError("unreachable overloaded retry state")
+
+    async def _sleep_before_overload_retry(self, attempt: int) -> None:
+        delay = min(0.25 * (2**attempt), self.timeout)
+        jitter = random.uniform(0.0, min(0.1, delay))
+        await asyncio.sleep(delay + jitter)
 
     async def _send(self, payload: dict[str, Any]) -> None:
         if self._ws is None:

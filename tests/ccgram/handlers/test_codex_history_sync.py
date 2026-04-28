@@ -193,7 +193,7 @@ async def test_pending_topic_skips_app_server_submitted_user_echo(tmp_path) -> N
         created_at=1.0,
         history_offset=first_offset,
         app_server_thread_id="sess-1",
-        last_submitted_prompt="continue from mobile",
+        submitted_prompt_echoes=("continue from mobile",),
     )
     bot = _bot()
 
@@ -211,7 +211,88 @@ async def test_pending_topic_skips_app_server_submitted_user_echo(tmp_path) -> N
     assert mock_safe_send.call_args.args[2] == "mobile answer"
     updated = state.pending_topics["100:77"]
     assert updated.history_offset == transcript.stat().st_size
-    assert updated.last_submitted_prompt == ""
+    assert updated.submitted_prompt_echoes == ()
+
+
+async def test_pending_topic_skips_multiple_submitted_user_echoes(tmp_path) -> None:
+    transcript = tmp_path / "session.jsonl"
+    first_line = (
+        '{"type":"event_msg","payload":{"type":"user_message",'
+        '"message":"first prompt"}}'
+    )
+    submitted_one = (
+        '{"type":"event_msg","payload":{"type":"user_message",'
+        '"message":"first mobile turn"}}'
+    )
+    submitted_two = (
+        '{"type":"event_msg","payload":{"type":"user_message",'
+        '"message":"second mobile turn"}}'
+    )
+    agent_line = (
+        '{"type":"event_msg","payload":{"type":"agent_message",'
+        '"message":"combined answer"}}'
+    )
+    _write_transcript(transcript, first_line)
+    first_offset = transcript.stat().st_size
+    _write_transcript(transcript, first_line, submitted_one, submitted_two, agent_line)
+    pending = PendingCodexTopic(
+        session_id="sess-1",
+        summary="first prompt",
+        cwd="/tmp/project",
+        transcript_path=str(transcript),
+        user_id=100,
+        chat_id=-100999,
+        thread_id=77,
+        topic_name="first prompt - project",
+        created_at=1.0,
+        history_offset=first_offset,
+        app_server_thread_id="sess-1",
+        submitted_prompt_echoes=("first mobile turn", "second mobile turn"),
+    )
+    bot = _bot()
+
+    with (
+        patch(f"{_CHS}.config", _config(tmp_path)),
+        patch(f"{_CHS}.scan_all_sessions", return_value=[]),
+        patch(f"{_CHS}.safe_send", new=AsyncMock()) as mock_safe_send,
+    ):
+        mock_safe_send.return_value = MagicMock()
+        _save_state(CodexHistoryState(True, {"sess-1"}, {"100:77": pending}))
+        await sync_codex_history_once(bot)
+        state = _load_state()
+
+    mock_safe_send.assert_awaited_once()
+    assert mock_safe_send.call_args.args[2] == "combined answer"
+    assert state.pending_topics["100:77"].submitted_prompt_echoes == ()
+
+
+def test_load_state_migrates_legacy_last_submitted_prompt(tmp_path) -> None:
+    cfg = _config(tmp_path)
+    cfg.codex_history_sync_file.write_text(
+        (
+            '{"initialized": true, "seen_session_ids": [], "pending_topics": {'
+            '"100:77": {'
+            '"session_id": "sess-1",'
+            '"summary": "hello",'
+            '"cwd": "/tmp/project",'
+            '"transcript_path": "/tmp/session.jsonl",'
+            '"user_id": 100,'
+            '"chat_id": -100999,'
+            '"thread_id": 77,'
+            '"topic_name": "hello - project",'
+            '"created_at": 1.0,'
+            '"last_submitted_prompt": "legacy prompt"'
+            "}}}"
+        ),
+        encoding="utf-8",
+    )
+
+    with patch(f"{_CHS}.config", cfg):
+        state = _load_state()
+
+    assert state.pending_topics["100:77"].submitted_prompt_echoes == (
+        "legacy prompt",
+    )
 
 
 def test_codex_event_history_reads_only_user_and_agent_messages(tmp_path) -> None:
@@ -322,7 +403,7 @@ async def test_pending_topic_submits_to_app_server_without_tmux_resume(tmp_path)
     mock_create.assert_not_awaited()
     mock_tr.set_group_chat_id.assert_called_once_with(100, 77, -100999)
     updated = state.pending_topics["100:77"]
-    assert updated.last_submitted_prompt == "continue from mobile"
+    assert updated.submitted_prompt_echoes == ("continue from mobile",)
     assert updated.app_server_thread_id == "thread-1"
 
 

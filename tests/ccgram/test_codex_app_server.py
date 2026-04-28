@@ -116,3 +116,34 @@ async def test_submit_turn_reports_active_thread_as_busy(monkeypatch) -> None:
 
     methods = [sent["method"] for sent in socket.sent]
     assert methods == ["initialize", "initialized", "thread/list"]
+
+
+async def test_overloaded_request_is_retried(monkeypatch) -> None:
+    socket = FakeWebSocket(
+        [
+            {"id": 1, "result": {"serverInfo": {"name": "codex"}}},
+            {
+                "id": 2,
+                "error": {
+                    "code": -32001,
+                    "message": "Server overloaded",
+                },
+            },
+            {"id": 3, "result": {"data": []}},
+        ]
+    )
+
+    async def fake_connect(*_args, **_kwargs) -> FakeWebSocket:
+        return socket
+
+    async def fake_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr("ccgram.codex_app_server.connect", fake_connect)
+    monkeypatch.setattr("ccgram.codex_app_server.asyncio.sleep", fake_sleep)
+
+    async with CodexAppServerClient("ws://127.0.0.1:9234") as client:
+        assert await client.list_threads() == []
+
+    methods = [sent["method"] for sent in socket.sent]
+    assert methods == ["initialize", "initialized", "thread/list", "thread/list"]

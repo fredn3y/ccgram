@@ -24,6 +24,7 @@ pytestmark = [
 ]
 
 
+@pytest.mark.timeout(150)
 async def test_basic_lifecycle(e2e_app, work_dir):
     app, calls, tmux, session_mgr = e2e_app
 

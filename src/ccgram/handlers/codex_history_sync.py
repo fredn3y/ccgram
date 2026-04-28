@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 import structlog
@@ -45,7 +45,7 @@ class PendingCodexTopic:
     created_at: float
     history_offset: int = 0
     app_server_thread_id: str = ""
-    last_submitted_prompt: str = ""
+    submitted_prompt_echoes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +83,33 @@ def _state_path() -> Path:
     return config.codex_history_sync_file
 
 
+def _submitted_prompt_echoes_from_state(item: dict) -> tuple[str, ...]:
+    prompts: list[str] = []
+    raw_prompts = item.get("submitted_prompt_echoes", [])
+    if isinstance(raw_prompts, (list, tuple)):
+        prompts.extend(str(prompt) for prompt in raw_prompts if str(prompt).strip())
+
+    legacy_prompt = str(item.get("last_submitted_prompt", "")).strip()
+    if legacy_prompt:
+        prompts.append(legacy_prompt)
+
+    return tuple(prompts)
+
+
+def _consume_submitted_prompt_echo(
+    submitted_prompt_echoes: tuple[str, ...],
+    text: str,
+) -> tuple[bool, tuple[str, ...]]:
+    normalized_text = text.strip()
+    for index, submitted_prompt in enumerate(submitted_prompt_echoes):
+        if submitted_prompt.strip() == normalized_text:
+            return (
+                True,
+                submitted_prompt_echoes[:index] + submitted_prompt_echoes[index + 1 :],
+            )
+    return False, submitted_prompt_echoes
+
+
 def _load_state() -> CodexHistoryState:
     path = _state_path()
     if not path.exists():
@@ -114,7 +141,7 @@ def _load_state() -> CodexHistoryState:
                 topic_name=str(item.get("topic_name", "")),
                 created_at=float(item.get("created_at", 0.0)),
                 history_offset=int(item.get("history_offset", 0)),
-                last_submitted_prompt=str(item.get("last_submitted_prompt", "")),
+                submitted_prompt_echoes=_submitted_prompt_echoes_from_state(item),
             )
         except (KeyError, TypeError, ValueError):
             continue
@@ -323,15 +350,15 @@ async def _send_pending_history(
     if not entries or new_offset == pending.history_offset:
         return pending
 
-    skipped_submitted_prompt = False
+    submitted_prompt_echoes = pending.submitted_prompt_echoes
     for entry in entries:
-        if (
-            entry.role == "user"
-            and pending.last_submitted_prompt
-            and entry.text.strip() == pending.last_submitted_prompt.strip()
-        ):
-            skipped_submitted_prompt = True
-            continue
+        if entry.role == "user":
+            matched, submitted_prompt_echoes = _consume_submitted_prompt_echo(
+                submitted_prompt_echoes,
+                entry.text,
+            )
+            if matched:
+                continue
 
         for chunk in split_message(entry.formatted, max_length=3900):
             sent = await safe_send(
@@ -344,21 +371,10 @@ async def _send_pending_history(
             if sent is None:
                 return pending
 
-    return PendingCodexTopic(
-        session_id=pending.session_id,
-        summary=pending.summary,
-        cwd=pending.cwd,
-        transcript_path=pending.transcript_path,
-        user_id=pending.user_id,
-        chat_id=pending.chat_id,
-        thread_id=pending.thread_id,
-        topic_name=pending.topic_name,
-        created_at=pending.created_at,
+    return replace(
+        pending,
         history_offset=new_offset,
-        app_server_thread_id=pending.app_server_thread_id,
-        last_submitted_prompt=(
-            "" if skipped_submitted_prompt else pending.last_submitted_prompt
-        ),
+        submitted_prompt_echoes=submitted_prompt_echoes,
     )
 
 
@@ -489,19 +505,10 @@ async def _mark_pending_topic_submitted(
         state = _load_state()
         key = _topic_key(user_id, thread_id)
         current = state.pending_topics.get(key, pending)
-        state.pending_topics[key] = PendingCodexTopic(
-            session_id=current.session_id,
-            summary=current.summary,
-            cwd=current.cwd,
-            transcript_path=current.transcript_path,
-            user_id=current.user_id,
-            chat_id=current.chat_id,
-            thread_id=current.thread_id,
-            topic_name=current.topic_name,
-            created_at=current.created_at,
-            history_offset=current.history_offset,
+        state.pending_topics[key] = replace(
+            current,
             app_server_thread_id=current.app_server_thread_id or current.session_id,
-            last_submitted_prompt=text,
+            submitted_prompt_echoes=(*current.submitted_prompt_echoes, text),
         )
         state.seen_session_ids.add(current.session_id)
         _save_state(state)
