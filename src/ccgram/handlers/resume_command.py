@@ -151,6 +151,7 @@ def _read_codex_resume_entry(jsonl_file: Path) -> ResumeEntry | None:
     session_id = ""
     cwd = ""
     summary = ""
+    fallback_summary = ""
 
     for data, payload in _iter_codex_payloads(jsonl_file):
         if data.get("type") == "session_meta":
@@ -158,14 +159,17 @@ def _read_codex_resume_entry(jsonl_file: Path) -> ResumeEntry | None:
             cwd = _first_str(payload.get("cwd"), cwd)
 
         if not summary:
-            summary = _extract_codex_user_summary(data, payload)
+            summary = _extract_codex_event_user_summary(data, payload)
+
+        if not fallback_summary:
+            fallback_summary = _extract_codex_item_user_summary(data, payload)
 
         if session_id and cwd and summary:
             break
 
     if not session_id or not cwd:
         return None
-    return ResumeEntry(session_id, summary or session_id[:12], cwd)
+    return ResumeEntry(session_id, summary or fallback_summary or session_id[:12], cwd)
 
 
 def _iter_codex_payloads(jsonl_file: Path):
@@ -196,8 +200,19 @@ def _first_str(value: object, fallback: str = "") -> str:
     return value if isinstance(value, str) and value else fallback
 
 
-def _extract_codex_user_summary(data: dict, payload: dict) -> str:
-    """Extract the first visible user prompt from a Codex transcript entry."""
+def _extract_codex_event_user_summary(data: dict, payload: dict) -> str:
+    """Extract a user-facing prompt from a Codex event entry."""
+    if data.get("type") != "event_msg" or payload.get("type") != "user_message":
+        return ""
+
+    text = _first_str(payload.get("message"))
+    if text:
+        return text[:80]
+    return _extract_codex_text(payload.get("text_elements"))
+
+
+def _extract_codex_item_user_summary(data: dict, payload: dict) -> str:
+    """Extract fallback user text from lower-level Codex transcript items."""
     if (
         data.get("type") == "response_item"
         and payload.get("type") == "message"
@@ -207,12 +222,6 @@ def _extract_codex_user_summary(data: dict, payload: dict) -> str:
 
     if data.get("type") == "input_item":
         return _extract_codex_text(payload.get("content"))
-
-    if data.get("type") == "event_msg" and payload.get("type") == "user_message":
-        text = _first_str(payload.get("message"))
-        if text:
-            return text
-        return _extract_codex_text(payload.get("text_elements"))
 
     return ""
 
