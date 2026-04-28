@@ -180,10 +180,10 @@ class Config:
         self._init_lifecycle()
 
         logger.debug(
-            "Config initialized: dir=%s, token=%s..., allowed_users=%d, "
+            "Config initialized: dir=%s, token=%s, allowed_users=%d, "
             "tmux_session=%s",
             self.config_dir,
-            self.telegram_bot_token[:8],
+            "present" if self.telegram_bot_token else "missing",
             len(self.allowed_users),
             self.tmux_session_name,
         )

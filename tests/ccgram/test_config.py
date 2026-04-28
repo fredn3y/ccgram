@@ -1,5 +1,6 @@
 import socket
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -19,6 +20,14 @@ class TestConfigValid:
         cfg = Config()
         assert cfg.telegram_bot_token == "test:token"
         assert cfg.allowed_users == {12345}
+
+    @patch("ccgram.config.logger.debug")
+    def test_debug_log_does_not_include_token_prefix(self, mock_debug):
+        Config()
+        logged_args = mock_debug.call_args.args
+        assert "test:token" not in logged_args
+        assert "test:tok" not in logged_args
+        assert "present" in logged_args
 
     def test_custom_tmux_session_name(self, monkeypatch):
         monkeypatch.setenv("TMUX_SESSION_NAME", "mysession")
