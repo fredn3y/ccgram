@@ -14,7 +14,9 @@ from telegram.error import TelegramError
 
 from ..config import config
 from ..thread_router import thread_router
+from ..telegram_sender import split_message
 from ..utils import atomic_write_json, task_done_callback
+from .message_sender import safe_send
 from .resume_command import ResumeEntry, _create_resume_window, scan_all_sessions
 from .resume_topics_command import _bound_session_ids, _topic_name_for_resume
 
@@ -36,6 +38,7 @@ class PendingCodexTopic:
     thread_id: int
     topic_name: str
     created_at: float
+    history_offset: int = 0
 
 
 @dataclass
@@ -82,6 +85,7 @@ def _load_state() -> CodexHistoryState:
                 thread_id=int(item["thread_id"]),
                 topic_name=str(item.get("topic_name", "")),
                 created_at=float(item.get("created_at", 0.0)),
+                history_offset=int(item.get("history_offset", 0)),
             )
         except (KeyError, TypeError, ValueError):
             continue
@@ -139,11 +143,16 @@ async def sync_codex_history_once(bot: Bot) -> None:
         return
 
     sessions = scan_all_sessions("codex")
-    if not sessions:
-        return
 
     async with _state_lock:
         state = _load_state()
+        if state.pending_topics:
+            await _sync_pending_history(bot, state)
+
+        if not sessions:
+            _save_state(state)
+            return
+
         session_ids = {entry.session_id for entry in sessions}
         if not state.initialized:
             state.initialized = True
@@ -163,6 +172,7 @@ async def sync_codex_history_once(bot: Bot) -> None:
             created = await _create_pending_topic(bot, target, entry)
             if created:
                 key, topic = created
+                topic = await _send_pending_history(bot, topic)
                 state.pending_topics[key] = topic
                 state.seen_session_ids.add(entry.session_id)
 
@@ -264,6 +274,91 @@ async def _create_pending_topic(
         entry.session_id,
     )
     return key, pending
+
+
+async def _sync_pending_history(bot: Bot, state: CodexHistoryState) -> None:
+    """Send newly available Codex transcript messages into pending topics."""
+    for key, pending in list(state.pending_topics.items()):
+        state.pending_topics[key] = await _send_pending_history(bot, pending)
+
+
+async def _send_pending_history(
+    bot: Bot,
+    pending: PendingCodexTopic,
+) -> PendingCodexTopic:
+    messages, new_offset = _read_codex_event_history(
+        pending.transcript_path,
+        pending.history_offset,
+    )
+    if not messages or new_offset == pending.history_offset:
+        return pending
+
+    for message in messages:
+        for chunk in split_message(message, max_length=3900):
+            sent = await safe_send(
+                bot,
+                pending.chat_id,
+                chunk,
+                message_thread_id=pending.thread_id,
+                disable_notification=True,
+            )
+            if sent is None:
+                return pending
+
+    return PendingCodexTopic(
+        session_id=pending.session_id,
+        summary=pending.summary,
+        cwd=pending.cwd,
+        transcript_path=pending.transcript_path,
+        user_id=pending.user_id,
+        chat_id=pending.chat_id,
+        thread_id=pending.thread_id,
+        topic_name=pending.topic_name,
+        created_at=pending.created_at,
+        history_offset=new_offset,
+    )
+
+
+def _read_codex_event_history(
+    transcript_path: str,
+    start_offset: int,
+) -> tuple[list[str], int]:
+    """Read user/assistant event messages from a Codex transcript."""
+    messages: list[str] = []
+    offset = max(0, start_offset)
+    try:
+        with open(transcript_path, "rb") as file:
+            file.seek(offset)
+            for raw_line in file:
+                offset += len(raw_line)
+                message = _parse_codex_event_history_line(raw_line)
+                if message:
+                    messages.append(message)
+    except OSError:
+        return [], start_offset
+    return messages, offset
+
+
+def _parse_codex_event_history_line(raw_line: bytes) -> str:
+    try:
+        entry = json.loads(raw_line.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return ""
+
+    if not isinstance(entry, dict) or entry.get("type") != "event_msg":
+        return ""
+    payload = entry.get("payload")
+    if not isinstance(payload, dict):
+        return ""
+
+    event_type = payload.get("type")
+    if event_type == "user_message":
+        text = str(payload.get("message") or "").strip()
+        return f"\U0001f464 {text}" if text else ""
+    if event_type == "agent_message":
+        text = str(payload.get("message") or "").strip()
+        return text
+    return ""
 
 
 async def activate_pending_codex_topic(
