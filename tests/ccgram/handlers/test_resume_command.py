@@ -405,6 +405,7 @@ class TestScanAllSessions:
         assert result[0].session_id == "019dd39a-08a9-7722-be78-b5a6a34974cb"
         assert result[0].cwd == str(project_dir)
         assert result[0].summary == "Pick up the mobile bridge work"
+        assert result[0].transcript_path == str(jsonl)
 
     def test_codex_provider_uses_event_message_summary(
         self, tmp_path, monkeypatch
@@ -679,22 +680,31 @@ class TestResumeCommand:
 class TestResumePickCallback:
     @patch(f"{_RC}.tmux_manager")
     @patch(f"{_RC}.thread_router")
+    @patch(f"{_RC}.session_map_sync")
     @patch(f"{_RC}.session_manager")
     @patch(f"{_RC}.safe_edit", new_callable=AsyncMock)
     @patch(f"{_RC}.get_thread_id", return_value=42)
-    async def test_pick_creates_window_with_resume(
+    async def test_pick_registers_hookless_resume_transcript(
         self,
         _mock_thread_id: MagicMock,
         _mock_safe_edit: AsyncMock,
         mock_sm: MagicMock,
+        mock_sms: MagicMock,
         mock_tr: MagicMock,
         mock_tm: MagicMock,
     ) -> None:
+        mock_provider = MagicMock()
+        mock_provider.capabilities.supports_hook = False
+        mock_provider.capabilities.name = "codex"
+        mock_provider.make_launch_args.return_value = (
+            "resume a1b2c3d4-0000-0000-0000-000000000001"
+        )
+        mock_sm.view_window.return_value = None
+        mock_sm.get_approval_mode.return_value = "normal"
         mock_tr.get_window_for_thread.return_value = None
         mock_tm.create_window = AsyncMock(
             return_value=(True, "Window created", "project", "@5")
         )
-        mock_sm.wait_for_session_map_entry = AsyncMock()
         mock_tr.resolve_chat_id.return_value = -100999
 
         update = _make_callback_update(data=f"{CB_RESUME_PICK}0")
@@ -704,20 +714,38 @@ class TestResumePickCallback:
                     "session_id": "a1b2c3d4-0000-0000-0000-000000000001",
                     "summary": "Fix bug",
                     "cwd": "/tmp/proj",
+                    "transcript_path": "/tmp/session.jsonl",
                 },
             ],
         }
         ctx = _make_context(user_data)
         query = update.callback_query
 
-        with patch(f"{_RC}.Path") as mock_path:
+        with (
+            patch(f"{_RC}.Path") as mock_path,
+            patch(f"{_RC}.get_provider", return_value=mock_provider),
+        ):
             mock_path.return_value.is_dir.return_value = True
             await handle_resume_command_callback(query, 100, query.data, update, ctx)
 
         mock_tm.create_window.assert_called_once_with(
             "/tmp/proj",
-            agent_args="--resume a1b2c3d4-0000-0000-0000-000000000001",
-            launch_command="claude",
+            agent_args="resume a1b2c3d4-0000-0000-0000-000000000001",
+            launch_command=ANY,
+        )
+        mock_sms.register_hookless_session.assert_called_once_with(
+            window_id="@5",
+            session_id="a1b2c3d4-0000-0000-0000-000000000001",
+            cwd="/tmp/proj",
+            transcript_path="/tmp/session.jsonl",
+            provider_name="codex",
+        )
+        mock_sms.write_hookless_session_map.assert_called_once_with(
+            window_id="@5",
+            session_id="a1b2c3d4-0000-0000-0000-000000000001",
+            cwd="/tmp/proj",
+            transcript_path="/tmp/session.jsonl",
+            provider_name="codex",
         )
         mock_tr.bind_thread.assert_called_once_with(
             100, 42, "@5", window_name="project"

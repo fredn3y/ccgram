@@ -912,6 +912,57 @@ class TestProviderSwitchPromptSetup:
 
 
 class TestMaybeDiscoverTranscript:
+    async def test_preserves_existing_hookless_transcript_for_window(
+        self, tmp_path
+    ) -> None:
+        from ccgram.handlers.transcript_discovery import (
+            discover_and_register_transcript,
+        )
+        from ccgram.providers.base import SessionStartEvent
+
+        existing_transcript = tmp_path / "existing.jsonl"
+        existing_transcript.write_text("{}\n")
+
+        mock_provider = MagicMock()
+        mock_provider.capabilities.supports_hook = False
+        mock_provider.capabilities.supports_mailbox_delivery = True
+        mock_provider.capabilities.name = "codex"
+        mock_provider.discover_transcript.return_value = SessionStartEvent(
+            session_id="newer-id",
+            cwd="/proj",
+            transcript_path="/path/newer.jsonl",
+            window_key="ccgram:@7",
+        )
+
+        with (
+            patch("ccgram.handlers.transcript_discovery.session_manager") as mock_sm,
+            patch("ccgram.handlers.transcript_discovery.session_map_sync") as mock_sms,
+            patch(
+                "ccgram.handlers.transcript_discovery.get_provider_for_window",
+                return_value=mock_provider,
+            ),
+            patch("ccgram.handlers.transcript_discovery.tmux_manager") as mock_tmux,
+            patch("ccgram.handlers.transcript_discovery.config") as mock_config,
+        ):
+            mock_sm.window_states = {
+                "@7": MagicMock(
+                    session_id="existing-id",
+                    cwd="/proj",
+                    transcript_path=str(existing_transcript),
+                    provider_name="codex",
+                )
+            }
+            mock_tmux.find_window_by_id = AsyncMock(
+                return_value=MagicMock(pane_current_command="bun")
+            )
+            mock_tmux.get_pane_title = AsyncMock(return_value="")
+            mock_config.tmux_session_name = "ccgram"
+            await discover_and_register_transcript("@7")
+
+        mock_provider.discover_transcript.assert_not_called()
+        mock_sms.register_hookless_session.assert_not_called()
+        mock_sms.write_hookless_session_map.assert_not_called()
+
     async def test_noop_when_discovered_session_matches_current(self) -> None:
         from ccgram.handlers.transcript_discovery import (
             discover_and_register_transcript,

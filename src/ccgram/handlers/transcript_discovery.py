@@ -11,6 +11,7 @@ Key components:
 """
 
 import asyncio
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import structlog
@@ -119,6 +120,15 @@ def _resolve_providers_to_try(
     ]
 
 
+def _has_registered_transcript(state: "WindowState", provider_name: str) -> bool:
+    """Return True when a window already has a live transcript binding."""
+    if not state.session_id or not state.transcript_path:
+        return False
+    if state.provider_name and state.provider_name != provider_name:
+        return False
+    return Path(state.transcript_path).exists()
+
+
 async def _find_and_register_transcript(
     window_id: str,
     state: "WindowState",
@@ -133,6 +143,9 @@ async def _find_and_register_transcript(
     )
 
     for provider_name, provider in providers_to_try:
+        if _has_registered_transcript(state, provider_name):
+            return
+
         max_age = 0 if pane_alive else None
         event = await asyncio.to_thread(
             provider.discover_transcript,

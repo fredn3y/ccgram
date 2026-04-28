@@ -11,6 +11,7 @@ Key functions:
   - scan_all_sessions: discover all resumable sessions across all projects
 """
 
+import asyncio
 import json
 import os
 from dataclasses import dataclass
@@ -57,6 +58,7 @@ class ResumeEntry:
     session_id: str
     summary: str
     cwd: str
+    transcript_path: str = ""
 
 
 def scan_all_sessions(provider_name: str | None = None) -> list[ResumeEntry]:
@@ -169,7 +171,12 @@ def _read_codex_resume_entry(jsonl_file: Path) -> ResumeEntry | None:
 
     if not session_id or not cwd:
         return None
-    return ResumeEntry(session_id, summary or fallback_summary or session_id[:12], cwd)
+    return ResumeEntry(
+        session_id,
+        summary or fallback_summary or session_id[:12],
+        cwd,
+        str(jsonl_file),
+    )
 
 
 def _iter_codex_payloads(jsonl_file: Path):
@@ -412,7 +419,12 @@ async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     session_dicts = [
-        {"session_id": s.session_id, "summary": s.summary, "cwd": s.cwd}
+        {
+            "session_id": s.session_id,
+            "summary": s.summary,
+            "cwd": s.cwd,
+            "transcript_path": s.transcript_path,
+        }
         for s in sessions
     ]
     if context.user_data is not None:
@@ -447,6 +459,7 @@ async def _create_resume_window(
     thread_id: int,
     session_id: str,
     cwd: str,
+    transcript_path: str = "",
 ) -> tuple[bool, str, str, str]:
     """Unbind old window, create a new one with resume args.
 
@@ -476,11 +489,27 @@ async def _create_resume_window(
         cwd, agent_args=launch_args, launch_command=launch_command
     )
     if success:
-        if provider.capabilities.supports_hook:
-            await session_map_sync.wait_for_session_map_entry(created_wid)
         session_manager.set_window_origin(created_wid, CCGRAM_CREATED_WINDOW_ORIGIN)
         session_manager.set_window_provider(created_wid, provider.capabilities.name)
         session_manager.set_window_approval_mode(created_wid, approval_mode)
+        if provider.capabilities.supports_hook:
+            await session_map_sync.wait_for_session_map_entry(created_wid)
+        elif transcript_path:
+            session_map_sync.register_hookless_session(
+                window_id=created_wid,
+                session_id=session_id,
+                cwd=cwd,
+                transcript_path=transcript_path,
+                provider_name=provider.capabilities.name,
+            )
+            await asyncio.to_thread(
+                session_map_sync.write_hookless_session_map,
+                window_id=created_wid,
+                session_id=session_id,
+                cwd=cwd,
+                transcript_path=transcript_path,
+                provider_name=provider.capabilities.name,
+            )
 
     return success, message, created_wname, created_wid
 
@@ -513,6 +542,7 @@ async def _handle_pick(
     picked = stored[idx]
     session_id = picked["session_id"]
     cwd = picked.get("cwd", "")
+    transcript_path = picked.get("transcript_path", "")
 
     if not cwd or not Path(cwd).is_dir():
         await safe_edit(query, "\u274c Project directory no longer exists.")
@@ -521,7 +551,7 @@ async def _handle_pick(
         return
 
     success, message, created_wname, created_wid = await _create_resume_window(
-        user_id, thread_id, session_id, cwd
+        user_id, thread_id, session_id, cwd, transcript_path
     )
     if not success:
         await safe_edit(query, f"\u274c {message}")
