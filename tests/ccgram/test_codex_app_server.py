@@ -5,6 +5,7 @@ import pytest
 from ccgram.codex_app_server import (
     CodexAppServerBusyError,
     CodexAppServerClient,
+    read_thread_names_from_app_server,
 )
 
 
@@ -147,3 +148,59 @@ async def test_overloaded_request_is_retried(monkeypatch) -> None:
 
     methods = [sent["method"] for sent in socket.sent]
     assert methods == ["initialize", "initialized", "thread/list", "thread/list"]
+
+
+async def test_set_thread_name_sends_thread_name_set(monkeypatch) -> None:
+    socket = FakeWebSocket(
+        [
+            {"id": 1, "result": {"serverInfo": {"name": "codex"}}},
+            {"id": 2, "result": {}},
+        ]
+    )
+
+    async def fake_connect(*_args, **_kwargs) -> FakeWebSocket:
+        return socket
+
+    monkeypatch.setattr("ccgram.codex_app_server.connect", fake_connect)
+
+    async with CodexAppServerClient("ws://127.0.0.1:9234") as client:
+        await client.set_thread_name("thread-1", "New title")
+
+    methods = [sent["method"] for sent in socket.sent]
+    assert methods == ["initialize", "initialized", "thread/name/set"]
+    assert socket.sent[-1]["params"] == {
+        "threadId": "thread-1",
+        "name": "New title",
+    }
+
+
+async def test_read_thread_names_reads_list_and_missing_threads(monkeypatch) -> None:
+    socket = FakeWebSocket(
+        [
+            {"id": 1, "result": {"serverInfo": {"name": "codex"}}},
+            {
+                "id": 2,
+                "result": {
+                    "data": [
+                        {"id": "thread-1", "name": "Listed"},
+                        {"id": "other", "name": "Ignore me"},
+                    ],
+                },
+            },
+            {"id": 3, "result": {"thread": {"id": "thread-2", "name": "Read"}}},
+        ]
+    )
+
+    async def fake_connect(*_args, **_kwargs) -> FakeWebSocket:
+        return socket
+
+    monkeypatch.setattr("ccgram.codex_app_server.connect", fake_connect)
+
+    names = await read_thread_names_from_app_server(
+        "ws://127.0.0.1:9234",
+        {"thread-1", "thread-2"},
+    )
+
+    assert names == {"thread-1": "Listed", "thread-2": "Read"}
+    methods = [sent["method"] for sent in socket.sent]
+    assert methods == ["initialize", "initialized", "thread/list", "thread/read"]

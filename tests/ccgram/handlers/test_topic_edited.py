@@ -61,10 +61,16 @@ class TestTopicEditedHandler:
         mock_tm.rename_window = AsyncMock(return_value=True)
 
         update = _make_update("new-name")
-        await topic_edited_handler(update, MagicMock())
+        with patch(
+            "ccgram.handlers.codex_history_sync.rename_app_server_synced_topic",
+            new_callable=AsyncMock,
+            return_value=True,
+        ) as mock_sync_name:
+            await topic_edited_handler(update, MagicMock())
 
         mock_tm.rename_window.assert_called_once_with("@0", "new-name")
         mock_sm.set_display_name.assert_called_once_with("@0", "new-name")
+        mock_sync_name.assert_awaited_once_with(1, 42, -100, "new-name")
 
     @_PATCH_ALLOWED
     @patch("ccgram.handlers.topic_lifecycle.tmux_manager")
@@ -111,9 +117,37 @@ class TestTopicEditedHandler:
         mock_tm.rename_window = AsyncMock()
 
         update = _make_update("new-name")
-        await topic_edited_handler(update, MagicMock())
+        with patch(
+            "ccgram.handlers.codex_history_sync.rename_app_server_synced_topic",
+            new_callable=AsyncMock,
+            return_value=False,
+        ):
+            await topic_edited_handler(update, MagicMock())
 
         mock_tm.rename_window.assert_not_called()
+
+    @_PATCH_ALLOWED
+    @patch("ccgram.handlers.topic_lifecycle.tmux_manager")
+    @patch("ccgram.handlers.topic_lifecycle.thread_router")
+    async def test_unbound_synced_topic_renames_app_server_thread(
+        self, mock_tr: MagicMock, mock_tm: MagicMock, _allowed: MagicMock
+    ) -> None:
+        from ccgram.handlers.topic_lifecycle import topic_edited_handler
+
+        mock_tr.get_window_for_chat_thread.return_value = None
+        mock_tm.rename_window = AsyncMock()
+
+        update = _make_update("new-name")
+        with patch(
+            "ccgram.handlers.codex_history_sync.rename_app_server_synced_topic",
+            new_callable=AsyncMock,
+            return_value=True,
+        ) as mock_sync_name:
+            await topic_edited_handler(update, MagicMock())
+
+        mock_tm.rename_window.assert_not_called()
+        mock_sync_name.assert_awaited_once_with(1, 42, -100, "new-name")
+        assert get_stored_topic_name(-100, 42) == "new-name"
 
     @_PATCH_ALLOWED
     @patch("ccgram.handlers.topic_lifecycle.tmux_manager")
@@ -130,7 +164,12 @@ class TestTopicEditedHandler:
         mock_tm.rename_window = AsyncMock(return_value=True)
 
         update = _make_update("new-name")
-        await topic_edited_handler(update, MagicMock())
+        with patch(
+            "ccgram.handlers.codex_history_sync.rename_app_server_synced_topic",
+            new_callable=AsyncMock,
+            return_value=False,
+        ):
+            await topic_edited_handler(update, MagicMock())
 
         assert _topic_names[(-100, 42)] == "new-name"
 
@@ -149,7 +188,12 @@ class TestTopicEditedHandler:
         mock_tm.rename_window = AsyncMock(return_value=False)
 
         update = _make_update("new-name")
-        await topic_edited_handler(update, MagicMock())
+        with patch(
+            "ccgram.handlers.codex_history_sync.rename_app_server_synced_topic",
+            new_callable=AsyncMock,
+            return_value=False,
+        ):
+            await topic_edited_handler(update, MagicMock())
 
         assert _topic_names[(-100, 42)] == "old-name"
         mock_tr.set_display_name.assert_not_called()

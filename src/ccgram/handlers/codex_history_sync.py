@@ -15,20 +15,25 @@ from telegram.error import TelegramError
 from ..codex_app_server import (
     CodexAppServerBusyError,
     CodexAppServerError,
+    read_thread_names_from_app_server,
+    set_thread_name_on_app_server,
     submit_turn_to_app_server,
 )
 from ..config import config
 from ..session import session_manager
 from ..thread_router import thread_router
 from ..telegram_sender import split_message
+from ..tmux_manager import tmux_manager
 from ..utils import atomic_write_json, task_done_callback
 from .message_sender import safe_send
 from .resume_command import ResumeEntry, _create_resume_window, scan_all_sessions
 from .resume_topics_command import _bound_session_ids, _topic_name_for_resume
+from .topic_emoji import strip_emoji_prefix, sync_topic_name, update_stored_topic_name
 
 logger = structlog.get_logger()
 
 _state_lock = asyncio.Lock()
+_TELEGRAM_TOPIC_NAME_MAX = 128
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,6 +213,7 @@ async def sync_codex_history_once(bot: Bot) -> None:
 
         if not sessions:
             _sync_bound_codex_topics(state, {}, target)
+            await _sync_app_server_thread_names(bot, state)
             _save_state(state)
             return
 
@@ -218,6 +224,7 @@ async def sync_codex_history_once(bot: Bot) -> None:
         if not state.initialized:
             state.initialized = True
             state.seen_session_ids.update(session_ids)
+            await _sync_app_server_thread_names(bot, state)
             _save_state(state)
             logger.info(
                 "Codex history sync seeded %d existing session(s)", len(session_ids)
@@ -226,6 +233,7 @@ async def sync_codex_history_once(bot: Bot) -> None:
 
         candidates = _new_session_candidates(sessions, state, target.user_id)
         if not candidates:
+            await _sync_app_server_thread_names(bot, state)
             _save_state(state)
             return
 
@@ -237,6 +245,7 @@ async def sync_codex_history_once(bot: Bot) -> None:
                 state.pending_topics[key] = topic
                 state.seen_session_ids.add(entry.session_id)
 
+        await _sync_app_server_thread_names(bot, state)
         _save_state(state)
 
 
@@ -330,6 +339,70 @@ def _transcript_size(transcript_path: str) -> int:
         return Path(transcript_path).stat().st_size
     except OSError:
         return 0
+
+
+async def _sync_app_server_thread_names(
+    bot: Bot,
+    state: CodexHistoryState,
+) -> None:
+    """Sync Codex app-server thread names into Telegram topic titles."""
+    if not config.codex_app_server_enabled:
+        return
+
+    thread_ids = {
+        topic.app_server_thread_id
+        for topic in state.pending_topics.values()
+        if topic.app_server_thread_id
+    }
+    if not thread_ids:
+        return
+
+    try:
+        thread_names = await read_thread_names_from_app_server(
+            config.codex_app_server_url,
+            thread_ids,
+            timeout=config.codex_app_server_timeout,
+        )
+    except CodexAppServerError as exc:
+        logger.debug("Codex app-server title sync skipped: %s", exc)
+        return
+
+    for key, topic in list(state.pending_topics.items()):
+        app_thread_id = topic.app_server_thread_id
+        if not app_thread_id:
+            continue
+        new_name = _normalize_topic_name(thread_names.get(app_thread_id, ""))
+        if not new_name or new_name == topic.topic_name:
+            continue
+        await sync_topic_name(bot, topic.chat_id, topic.thread_id, new_name)
+        await _rename_bound_window_for_topic(topic.user_id, topic.thread_id, new_name)
+        update_stored_topic_name(topic.chat_id, topic.thread_id, new_name)
+        state.pending_topics[key] = replace(topic, topic_name=new_name)
+        logger.info(
+            "Synced Codex thread title to Telegram topic %d: %r",
+            topic.thread_id,
+            new_name,
+        )
+
+
+async def _rename_bound_window_for_topic(
+    user_id: int,
+    thread_id: int,
+    name: str,
+) -> None:
+    window_id = thread_router.get_window_for_thread(user_id, thread_id)
+    if not window_id:
+        return
+    current = thread_router.get_display_name(window_id)
+    if strip_emoji_prefix(current) == name:
+        return
+    if await tmux_manager.rename_window(window_id, name):
+        session_manager.set_display_name(window_id, name)
+
+
+def _normalize_topic_name(name: str) -> str:
+    clean = " ".join(strip_emoji_prefix(str(name or "")).split())
+    return clean[:_TELEGRAM_TOPIC_NAME_MAX].rstrip(" -") if clean else ""
 
 
 def _has_user_summary(entry: ResumeEntry) -> bool:
@@ -571,6 +644,52 @@ async def submit_or_activate_pending_codex_topic(
     if window_id is None:
         return PendingCodexAction("failed")
     return PendingCodexAction("fallback_window", window_id=window_id)
+
+
+async def rename_app_server_synced_topic(
+    user_id: int,
+    thread_id: int,
+    chat_id: int,
+    name: str,
+) -> bool:
+    """Push a Telegram topic rename into the synced Codex app-server thread."""
+    clean_name = _normalize_topic_name(name)
+    if not clean_name:
+        return False
+
+    async with _state_lock:
+        state = _load_state()
+        pending = state.pending_topics.get(_topic_key(user_id, thread_id))
+        if not pending or not pending.app_server_thread_id:
+            return False
+
+    if not config.codex_app_server_enabled:
+        return False
+
+    try:
+        await set_thread_name_on_app_server(
+            config.codex_app_server_url,
+            pending.app_server_thread_id,
+            clean_name,
+            timeout=config.codex_app_server_timeout,
+        )
+    except CodexAppServerError as exc:
+        logger.warning(
+            "Codex app-server title update failed for topic %d: %s",
+            thread_id,
+            exc,
+        )
+        return False
+
+    thread_router.set_group_chat_id(user_id, thread_id, chat_id)
+    async with _state_lock:
+        state = _load_state()
+        key = _topic_key(user_id, thread_id)
+        current = state.pending_topics.get(key, pending)
+        state.pending_topics[key] = replace(current, topic_name=clean_name)
+        state.seen_session_ids.add(current.session_id)
+        _save_state(state)
+    return True
 
 
 async def _mark_pending_topic_submitted(

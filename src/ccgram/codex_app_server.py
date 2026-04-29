@@ -1,7 +1,7 @@
 """Codex app-server JSON-RPC client.
 
 This is intentionally small and scoped to the bridge methods CCGram needs:
-initialize, thread/list, thread/read, thread/resume, and turn/start.
+initialize, thread/list, thread/read, thread/resume, thread/name/set, and turn/start.
 """
 
 from __future__ import annotations
@@ -205,6 +205,17 @@ class CodexAppServerClient:
             raise CodexAppServerProtocolError("thread/resume returned no thread")
         return thread
 
+    async def set_thread_name(self, thread_id: str, name: str) -> None:
+        result = await self._request(
+            "thread/name/set",
+            {
+                "threadId": thread_id,
+                "name": name,
+            },
+        )
+        if not isinstance(result, dict):
+            raise CodexAppServerProtocolError("thread/name/set returned a non-object")
+
     async def start_turn(self, thread_id: str, text: str) -> CodexTurnSubmission:
         try:
             result = await self._request(
@@ -259,6 +270,63 @@ async def submit_turn_to_app_server(
     """Submit text to a Codex app-server thread."""
     async with CodexAppServerClient(url, timeout=timeout) as client:
         return await client.submit_turn(thread_id, text)
+
+
+async def set_thread_name_on_app_server(
+    url: str,
+    thread_id: str,
+    name: str,
+    *,
+    timeout: float = 3.0,
+) -> None:
+    """Set a Codex app-server thread's user-facing name."""
+    async with CodexAppServerClient(url, timeout=timeout) as client:
+        await client.set_thread_name(thread_id, name)
+
+
+async def read_thread_names_from_app_server(
+    url: str,
+    thread_ids: set[str],
+    *,
+    timeout: float = 3.0,
+) -> dict[str, str]:
+    """Read user-facing thread names for known Codex app-server threads."""
+    if not thread_ids:
+        return {}
+
+    async with CodexAppServerClient(url, timeout=timeout) as client:
+        threads = await client.list_threads(limit=max(100, len(thread_ids)))
+        names = _names_from_threads(threads, thread_ids)
+
+        for thread_id in sorted(thread_ids - set(names)):
+            try:
+                thread = await client.read_thread(thread_id)
+            except CodexAppServerError:
+                continue
+            name = _thread_name(thread)
+            if name:
+                names[thread_id] = name
+        return names
+
+
+def _names_from_threads(
+    threads: list[dict[str, Any]],
+    thread_ids: set[str],
+) -> dict[str, str]:
+    names: dict[str, str] = {}
+    for thread in threads:
+        thread_id = thread.get("id")
+        if not isinstance(thread_id, str) or thread_id not in thread_ids:
+            continue
+        name = _thread_name(thread)
+        if name:
+            names[thread_id] = name
+    return names
+
+
+def _thread_name(thread: dict[str, Any]) -> str:
+    name = thread.get("name")
+    return name.strip() if isinstance(name, str) else ""
 
 
 def _status_type(thread: dict[str, Any]) -> str:

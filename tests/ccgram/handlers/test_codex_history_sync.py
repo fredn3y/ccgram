@@ -1,6 +1,8 @@
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from ccgram.codex_app_server import (
     CodexAppServerBusyError,
     CodexAppServerError,
@@ -13,6 +15,7 @@ from ccgram.handlers.codex_history_sync import (
     _load_state,
     _save_state,
     activate_pending_codex_topic,
+    rename_app_server_synced_topic,
     submit_or_activate_pending_codex_topic,
     sync_codex_history_once,
 )
@@ -40,6 +43,15 @@ def _bot(thread_id: int = 77) -> MagicMock:
     bot = MagicMock()
     bot.create_forum_topic = AsyncMock(return_value=topic)
     return bot
+
+
+@pytest.fixture(autouse=True)
+def mock_read_thread_names():
+    with patch(
+        f"{_CHS}.read_thread_names_from_app_server",
+        new=AsyncMock(return_value={}),
+    ) as mock:
+        yield mock
 
 
 def _write_transcript(path, *payloads: str) -> None:
@@ -162,6 +174,63 @@ async def test_scan_records_existing_bound_codex_topic_for_app_server_sync(
     assert pending.app_server_thread_id == "sess-bound"
     assert pending.history_offset == transcript.stat().st_size
     assert state.seen_session_ids == {"sess-bound"}
+
+
+async def test_sync_app_server_thread_name_updates_telegram_topic_and_state(
+    tmp_path,
+    mock_read_thread_names: AsyncMock,
+) -> None:
+    cwd = tmp_path / "second-brain"
+    cwd.mkdir()
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text("", encoding="utf-8")
+    entry = ResumeEntry("sess-1", "Existing session", str(cwd), str(transcript))
+    pending = PendingCodexTopic(
+        session_id="sess-1",
+        summary="Existing session",
+        cwd=str(cwd),
+        transcript_path=str(transcript),
+        user_id=100,
+        chat_id=-100999,
+        thread_id=77,
+        topic_name="Old title",
+        created_at=1.0,
+        app_server_thread_id="thread-1",
+    )
+    bot = _bot()
+    mock_read_thread_names.return_value = {"thread-1": "Desktop Title"}
+
+    with (
+        patch(f"{_CHS}.config", _config(tmp_path)),
+        patch(f"{_CHS}._bound_session_ids", return_value=set()),
+        patch(f"{_CHS}.scan_all_sessions", return_value=[entry]),
+        patch(f"{_CHS}.thread_router") as mock_tr,
+        patch(f"{_CHS}.tmux_manager") as mock_tm,
+        patch(f"{_CHS}.session_manager") as mock_sm,
+        patch(f"{_CHS}.sync_topic_name", new=AsyncMock()) as mock_sync_topic_name,
+    ):
+        mock_tr.iter_thread_bindings.return_value = []
+        mock_tr.get_window_for_thread.return_value = "@11"
+        mock_tr.get_display_name.return_value = "Old title"
+        mock_tm.rename_window = AsyncMock(return_value=True)
+        _save_state(CodexHistoryState(True, {"sess-1"}, {"100:77": pending}))
+        await sync_codex_history_once(bot)
+        state = _load_state()
+
+    mock_read_thread_names.assert_awaited_once_with(
+        "ws://127.0.0.1:9234",
+        {"thread-1"},
+        timeout=2.0,
+    )
+    mock_sync_topic_name.assert_awaited_once_with(
+        bot,
+        -100999,
+        77,
+        "Desktop Title",
+    )
+    mock_tm.rename_window.assert_awaited_once_with("@11", "Desktop Title")
+    mock_sm.set_display_name.assert_called_once_with("@11", "Desktop Title")
+    assert state.pending_topics["100:77"].topic_name == "Desktop Title"
 
 
 async def test_pending_topic_backfills_later_agent_message(tmp_path) -> None:
@@ -351,6 +420,50 @@ def test_codex_event_history_reads_only_user_and_agent_messages(tmp_path) -> Non
 
     assert messages == ["\U0001f464 hello", "world"]
     assert offset == transcript.stat().st_size
+
+
+async def test_rename_app_server_synced_topic_pushes_telegram_name_to_app_server(
+    tmp_path,
+) -> None:
+    pending = PendingCodexTopic(
+        session_id="sess-1",
+        summary="reply hello",
+        cwd="/tmp/project",
+        transcript_path="/tmp/session.jsonl",
+        user_id=100,
+        chat_id=-100999,
+        thread_id=77,
+        topic_name="Old title",
+        created_at=1.0,
+        app_server_thread_id="thread-1",
+    )
+
+    with (
+        patch(f"{_CHS}.config", _config(tmp_path)),
+        patch(f"{_CHS}.thread_router") as mock_tr,
+        patch(
+            f"{_CHS}.set_thread_name_on_app_server",
+            new=AsyncMock(),
+        ) as mock_set_thread_name,
+    ):
+        _save_state(CodexHistoryState(True, {"sess-1"}, {"100:77": pending}))
+        synced = await rename_app_server_synced_topic(
+            100,
+            77,
+            -100999,
+            "\U0001f7e2 Telegram Title  ",
+        )
+        state = _load_state()
+
+    assert synced is True
+    mock_set_thread_name.assert_awaited_once_with(
+        "ws://127.0.0.1:9234",
+        "thread-1",
+        "Telegram Title",
+        timeout=2.0,
+    )
+    mock_tr.set_group_chat_id.assert_called_once_with(100, 77, -100999)
+    assert state.pending_topics["100:77"].topic_name == "Telegram Title"
 
 
 async def test_activate_pending_topic_resumes_and_binds(tmp_path) -> None:

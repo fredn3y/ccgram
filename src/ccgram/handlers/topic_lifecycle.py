@@ -315,7 +315,7 @@ async def topic_edited_handler(
         return
 
     from .callback_helpers import get_thread_id
-    from .topic_emoji import strip_emoji_prefix, update_stored_topic_name
+    from .topic_emoji import strip_emoji_prefix
 
     thread_id = get_thread_id(update)
     if thread_id is None:
@@ -325,12 +325,49 @@ async def topic_edited_handler(
     if chat_id is None:
         return
 
+    clean_name = strip_emoji_prefix(new_name)
     window_id = thread_router.get_window_for_chat_thread(chat_id, thread_id)
     if not window_id:
-        logger.debug("Topic edited: no binding (thread=%d)", thread_id)
+        await _rename_unbound_app_server_topic(user.id, thread_id, chat_id, clean_name)
         return
 
-    clean_name = strip_emoji_prefix(new_name)
+    await _rename_bound_topic(user.id, thread_id, chat_id, window_id, clean_name)
+
+
+async def _rename_unbound_app_server_topic(
+    user_id: int,
+    thread_id: int,
+    chat_id: int,
+    clean_name: str,
+) -> None:
+    from .codex_history_sync import rename_app_server_synced_topic
+    from .topic_emoji import update_stored_topic_name
+
+    synced = await rename_app_server_synced_topic(
+        user_id,
+        thread_id,
+        chat_id,
+        clean_name,
+    )
+    if synced:
+        update_stored_topic_name(chat_id, thread_id, clean_name)
+        logger.info(
+            "Topic renamed: app-server thread → %r (thread=%d)",
+            clean_name,
+            thread_id,
+        )
+    else:
+        logger.debug("Topic edited: no binding (thread=%d)", thread_id)
+
+
+async def _rename_bound_topic(
+    user_id: int,
+    thread_id: int,
+    chat_id: int,
+    window_id: str,
+    clean_name: str,
+) -> None:
+    from .topic_emoji import strip_emoji_prefix, update_stored_topic_name
 
     current_display = thread_router.get_display_name(window_id)
     if current_display and strip_emoji_prefix(current_display) == clean_name:
@@ -339,9 +376,13 @@ async def topic_edited_handler(
         )
         return
 
+    from .codex_history_sync import rename_app_server_synced_topic
+
     renamed = await tmux_manager.rename_window(window_id, clean_name)
+    synced = await rename_app_server_synced_topic(user_id, thread_id, chat_id, clean_name)
     if renamed:
         session_manager.set_display_name(window_id, clean_name)
+    if renamed or synced:
         update_stored_topic_name(chat_id, thread_id, clean_name)
         logger.info(
             "Topic renamed: window %s → %r (thread=%d)",
