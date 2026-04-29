@@ -216,13 +216,23 @@ class CodexAppServerClient:
         if not isinstance(result, dict):
             raise CodexAppServerProtocolError("thread/name/set returned a non-object")
 
-    async def start_turn(self, thread_id: str, text: str) -> CodexTurnSubmission:
+    async def start_turn(
+        self,
+        thread_id: str,
+        text: str,
+        *,
+        extra_input: list[dict[str, Any]] | None = None,
+    ) -> CodexTurnSubmission:
+        input_items = [
+            {"type": "text", "text": text, "text_elements": []},
+            *(extra_input or []),
+        ]
         try:
             result = await self._request(
                 "turn/start",
                 {
                     "threadId": thread_id,
-                    "input": [{"type": "text", "text": text, "text_elements": []}],
+                    "input": input_items,
                 },
             )
         except CodexAppServerRequestError as exc:
@@ -238,7 +248,13 @@ class CodexAppServerClient:
             raise CodexAppServerProtocolError("turn/start returned no turn id")
         return CodexTurnSubmission(thread_id=thread_id, turn_id=turn_id)
 
-    async def submit_turn(self, thread_id: str, text: str) -> CodexTurnSubmission:
+    async def submit_turn(
+        self,
+        thread_id: str,
+        text: str,
+        *,
+        extra_input: list[dict[str, Any]] | None = None,
+    ) -> CodexTurnSubmission:
         """Ensure a thread is idle, then submit a user turn."""
         listed_thread = await self._find_listed_thread(thread_id)
         thread = listed_thread if listed_thread is not None else await self.read_thread(thread_id)
@@ -251,7 +267,7 @@ class CodexAppServerClient:
             if _status_type(thread) == "active":
                 raise CodexAppServerBusyError("Codex app-server thread is active")
 
-        return await self.start_turn(thread_id, text)
+        return await self.start_turn(thread_id, text, extra_input=extra_input)
 
     async def _find_listed_thread(self, thread_id: str) -> dict[str, Any] | None:
         for thread in await self.list_threads():
@@ -266,10 +282,11 @@ async def submit_turn_to_app_server(
     text: str,
     *,
     timeout: float = 3.0,
+    extra_input: list[dict[str, Any]] | None = None,
 ) -> CodexTurnSubmission:
     """Submit text to a Codex app-server thread."""
     async with CodexAppServerClient(url, timeout=timeout) as client:
-        return await client.submit_turn(thread_id, text)
+        return await client.submit_turn(thread_id, text, extra_input=extra_input)
 
 
 async def set_thread_name_on_app_server(

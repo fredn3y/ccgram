@@ -174,6 +174,44 @@ async def test_set_thread_name_sends_thread_name_set(monkeypatch) -> None:
     }
 
 
+async def test_start_turn_can_include_local_image_input(monkeypatch) -> None:
+    socket = FakeWebSocket(
+        [
+            {"id": 1, "result": {"serverInfo": {"name": "codex"}}},
+            {
+                "id": 2,
+                "result": {
+                    "turn": {
+                        "id": "turn-1",
+                    }
+                },
+            },
+        ]
+    )
+
+    async def fake_connect(*_args, **_kwargs) -> FakeWebSocket:
+        return socket
+
+    monkeypatch.setattr("ccgram.codex_app_server.connect", fake_connect)
+
+    async with CodexAppServerClient("ws://127.0.0.1:9234") as client:
+        await client.start_turn(
+            "thread-1",
+            "Please inspect this screenshot.",
+            extra_input=[{"type": "localImage", "path": "/tmp/shot.jpg"}],
+        )
+
+    assert socket.sent[-1]["method"] == "turn/start"
+    assert socket.sent[-1]["params"]["input"] == [
+        {
+            "type": "text",
+            "text": "Please inspect this screenshot.",
+            "text_elements": [],
+        },
+        {"type": "localImage", "path": "/tmp/shot.jpg"},
+    ]
+
+
 async def test_read_thread_names_reads_list_and_missing_threads(monkeypatch) -> None:
     socket = FakeWebSocket(
         [

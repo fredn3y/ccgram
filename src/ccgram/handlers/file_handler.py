@@ -1,8 +1,8 @@
-"""Photo and document message handlers for forwarding files to Claude Code.
+"""Photo and document message handlers for forwarding files to agent sessions.
 
 Saves uploaded files to `.ccgram-uploads/` in the session's cwd, then sends
-Claude a natural-language message with the relative path so it can read the
-file via its Read tool.
+the agent a natural-language message with the relative path so it can read or
+inspect the file.
 
 Key handlers:
   - handle_photo_message: handles filters.PHOTO
@@ -11,6 +11,7 @@ Key handlers:
 
 import structlog
 import re
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -24,6 +25,10 @@ from ..window_query import view_window
 from ..tmux_manager import send_to_window
 from ..thread_router import thread_router
 from .callback_helpers import get_thread_id
+from .codex_history_sync import (
+    resolve_pending_codex_attachment_target,
+    submit_attachment_to_pending_codex_topic,
+)
 from .message_sender import ack_reaction, safe_reply
 
 logger = structlog.get_logger()
@@ -45,6 +50,13 @@ _CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 # Max caption length forwarded to Claude
 _MAX_CAPTION_LEN = 500
+
+
+@dataclass(frozen=True, slots=True)
+class _UploadTarget:
+    upload_path: Path
+    window_id: str = ""
+    app_server: bool = False
 
 
 def _sanitize_filename(name: str) -> str:
@@ -107,23 +119,32 @@ def _generate_photo_filename(file_unique_id: str) -> str:
     return f"photo_{timestamp}_{short_id}.jpg"
 
 
-def _resolve_upload_dir(
+async def _resolve_upload_target(
     user_id: int, thread_id: int | None
-) -> tuple[str | None, Path | None, str | None]:
+) -> tuple[_UploadTarget | None, str | None]:
     """Resolve window_id and upload directory for a thread.
 
-    Returns (window_id, upload_path, error_message).
+    Returns (target, error_message). App-server-synced Codex topics are
+    preferred over tmux bindings so Telegram uploads stay in the Desktop thread.
     """
+    if thread_id is not None:
+        pending = await resolve_pending_codex_attachment_target(user_id, thread_id)
+        if pending:
+            cwd = Path(pending.cwd)
+            if not cwd.is_dir():
+                return None, "Session working directory no longer exists."
+            return _UploadTarget(cwd / _UPLOAD_DIR, app_server=True), None
+
     window_id = thread_router.resolve_window_for_thread(user_id, thread_id)
     if not window_id:
-        return None, None, "No session bound to this topic."
+        return None, "No session bound to this topic."
 
     view = view_window(window_id)
     if view is None or not view.cwd:
-        return window_id, None, "Session has no working directory."
+        return None, "Session has no working directory."
 
     upload_path = Path(view.cwd) / _UPLOAD_DIR
-    return window_id, upload_path, None
+    return _UploadTarget(upload_path, window_id=window_id), None
 
 
 async def _download_and_save(
@@ -192,35 +213,101 @@ async def _upload_and_notify(
     size_label: str,
     claude_msg_tpl: str,
     success_emoji: str,
+    *,
+    app_server_input_kind: str,
 ) -> None:
-    """Shared upload flow: resolve dir, download, notify Claude, reply to user."""
-    window_id, upload_path, error = _resolve_upload_dir(user_id, thread_id)
-    if error or not window_id or not upload_path:
+    """Shared upload flow: resolve dir, download, notify agent, reply to user."""
+    target, error = await _resolve_upload_target(user_id, thread_id)
+    if error or not target:
         await safe_reply(message, f"\u274c {error}")
         return
 
     await message.chat.send_action(ChatAction.TYPING)
 
     saved_name = await _download_and_save(
-        message, upload_path, filename, file_id, file_size, size_label
+        message, target.upload_path, filename, file_id, file_size, size_label
     )
     if not saved_name:
         return
 
     rel_path = f"{_UPLOAD_DIR}/{saved_name}"
     caption = message.caption or ""
-    claude_msg = claude_msg_tpl.format(name=saved_name, path=rel_path)
+    agent_msg = claude_msg_tpl.format(name=saved_name, path=rel_path)
     if caption:
-        claude_msg += f"\n\nUser note: {_sanitize_caption(caption)}"
+        agent_msg += f"\n\nUser note: {_sanitize_caption(caption)}"
 
-    success, err = await send_to_window(window_id, claude_msg)
+    if target.app_server:
+        await _notify_app_server_upload(
+            message,
+            user_id,
+            thread_id,
+            agent_msg,
+            target.upload_path / saved_name,
+            saved_name,
+            success_emoji,
+            app_server_input_kind,
+        )
+        return
+
+    success, err = await send_to_window(target.window_id, agent_msg)
     if success:
         await ack_reaction(message.get_bot(), message.chat.id, message.message_id)
         await safe_reply(message, f"{success_emoji} Uploaded `{rel_path}`")
     else:
         await safe_reply(
-            message, f"\u274c File saved but failed to notify Claude: {err}"
+            message, f"\u274c File saved but failed to notify agent: {err}"
         )
+
+
+async def _notify_app_server_upload(
+    message: Message,
+    user_id: int,
+    thread_id: int | None,
+    agent_msg: str,
+    saved_path: Path,
+    saved_name: str,
+    success_emoji: str,
+    input_kind: str,
+) -> None:
+    """Submit an uploaded file notification to a synced Codex app-server topic."""
+    if thread_id is None:
+        await safe_reply(message, "\u274c Use uploads inside a named topic.")
+        return
+
+    input_items = _app_server_input_items(saved_path, saved_name, input_kind)
+    action = await submit_attachment_to_pending_codex_topic(
+        user_id,
+        thread_id,
+        message.chat.id,
+        agent_msg,
+        extra_input=input_items,
+    )
+    if action.status == "submitted":
+        await ack_reaction(message.get_bot(), message.chat.id, message.message_id)
+        await safe_reply(message, f"{success_emoji} Uploaded `{_UPLOAD_DIR}/{saved_name}`")
+        return
+    if action.status == "busy":
+        await safe_reply(
+            message,
+            "\u23f3 Codex Desktop is already working in this thread. "
+            "Try the upload again when the current turn finishes.",
+        )
+        return
+    await safe_reply(
+        message,
+        f"\u274c File saved but failed to notify Codex Desktop: {action.message}",
+    )
+
+
+def _app_server_input_items(
+    saved_path: Path,
+    saved_name: str,
+    input_kind: str,
+) -> list[dict[str, object]]:
+    """Build Codex app-server inputs for uploaded files."""
+    if input_kind == "image":
+        return [{"type": "localImage", "path": str(saved_path)}]
+    return [{"type": "mention", "name": saved_name, "path": str(saved_path)}]
 
 
 async def handle_photo_message(
@@ -246,6 +333,7 @@ async def handle_photo_message(
         "Photo",
         "I've uploaded an image to {path} — please take a look.",
         "\U0001f4f7",
+        app_server_input_kind="image",
     )
 
 
@@ -272,4 +360,5 @@ async def handle_document_message(
         "File",
         "I've uploaded {name} to {path}",
         "\U0001f4ce",
+        app_server_input_kind="file",
     )

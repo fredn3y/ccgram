@@ -63,6 +63,15 @@ class PendingCodexAction:
     message: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class PendingCodexAttachmentTarget:
+    """Filesystem target for app-server-synced Codex topic uploads."""
+
+    session_id: str
+    cwd: str
+    app_server_thread_id: str
+
+
 @dataclass
 class CodexHistoryState:
     """Persisted sync state for Codex Desktop history topics."""
@@ -590,6 +599,7 @@ async def submit_or_activate_pending_codex_topic(
     chat_id: int,
     text: str,
     fallback_window_id: str | None = None,
+    extra_input: list[dict[str, object]] | None = None,
 ) -> PendingCodexAction:
     """Submit to app-server for pending Codex topics, falling back to tmux resume."""
     async with _state_lock:
@@ -600,11 +610,14 @@ async def submit_or_activate_pending_codex_topic(
 
     if config.codex_app_server_enabled and pending.app_server_thread_id:
         try:
+            submit_kwargs = {"timeout": config.codex_app_server_timeout}
+            if extra_input is not None:
+                submit_kwargs["extra_input"] = extra_input
             submission = await submit_turn_to_app_server(
                 config.codex_app_server_url,
                 pending.app_server_thread_id,
                 text,
-                timeout=config.codex_app_server_timeout,
+                **submit_kwargs,
             )
         except CodexAppServerBusyError as exc:
             logger.info(
@@ -644,6 +657,76 @@ async def submit_or_activate_pending_codex_topic(
     if window_id is None:
         return PendingCodexAction("failed")
     return PendingCodexAction("fallback_window", window_id=window_id)
+
+
+async def resolve_pending_codex_attachment_target(
+    user_id: int,
+    thread_id: int,
+) -> PendingCodexAttachmentTarget | None:
+    """Return upload target metadata for an app-server-synced Codex topic."""
+    if not config.codex_app_server_enabled:
+        return None
+
+    async with _state_lock:
+        state = _load_state()
+        pending = state.pending_topics.get(_topic_key(user_id, thread_id))
+        if not pending or not pending.app_server_thread_id or not pending.cwd:
+            return None
+        return PendingCodexAttachmentTarget(
+            session_id=pending.session_id,
+            cwd=pending.cwd,
+            app_server_thread_id=pending.app_server_thread_id,
+        )
+
+
+async def submit_attachment_to_pending_codex_topic(
+    user_id: int,
+    thread_id: int,
+    chat_id: int,
+    text: str,
+    *,
+    extra_input: list[dict[str, object]] | None = None,
+) -> PendingCodexAction:
+    """Submit an uploaded attachment prompt to a synced Codex app-server topic.
+
+    This deliberately does not activate a tmux fallback. Attachment support for
+    synced topics should remain in the Desktop/app-server thread so the UI stays
+    coherent across Telegram and Codex Desktop.
+    """
+    async with _state_lock:
+        state = _load_state()
+        pending = state.pending_topics.get(_topic_key(user_id, thread_id))
+        if not pending or not pending.app_server_thread_id:
+            return PendingCodexAction("not_pending")
+
+    if not config.codex_app_server_enabled:
+        return PendingCodexAction("not_pending")
+
+    try:
+        submission = await submit_turn_to_app_server(
+            config.codex_app_server_url,
+            pending.app_server_thread_id,
+            text,
+            timeout=config.codex_app_server_timeout,
+            extra_input=extra_input,
+        )
+    except CodexAppServerBusyError as exc:
+        logger.info(
+            "Codex app-server thread %s is busy for attachment topic %d",
+            pending.app_server_thread_id,
+            thread_id,
+        )
+        return PendingCodexAction("busy", message=str(exc))
+    except CodexAppServerError as exc:
+        logger.warning(
+            "Codex app-server attachment submit failed for topic %d: %s",
+            thread_id,
+            exc,
+        )
+        return PendingCodexAction("failed", message=str(exc))
+
+    await _mark_pending_topic_submitted(pending, user_id, thread_id, chat_id, text)
+    return PendingCodexAction("submitted", message=submission.turn_id)
 
 
 async def rename_app_server_synced_topic(

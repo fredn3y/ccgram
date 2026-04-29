@@ -2,13 +2,17 @@
 
 import re
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from ccgram.handlers.codex_history_sync import PendingCodexAction
 from ccgram.handlers.file_handler import (
     _generate_photo_filename,
     _sanitize_caption,
     _sanitize_filename,
+    _upload_and_notify,
     _unique_dest,
     _validate_dest_path,
 )
@@ -120,3 +124,144 @@ class TestGeneratePhotoFilename:
     def test_format(self) -> None:
         result = _generate_photo_filename("ABCDEFGHIJKLMNOP")
         assert re.match(r"^photo_\d{8}_\d{6}_ABCDEFGH\.jpg$", result)
+
+
+class TestUploadAndNotify:
+    def _message(self) -> MagicMock:
+        message = MagicMock()
+        message.caption = ""
+        message.chat.id = -100999
+        message.chat.send_action = AsyncMock()
+        message.message_id = 500
+        bot = MagicMock()
+        bot.get_file = AsyncMock()
+        message.get_bot.return_value = bot
+        return message
+
+    async def test_app_server_synced_photo_upload_submits_local_image(
+        self, tmp_path: Path
+    ) -> None:
+        message = self._message()
+        message.caption = "check this"
+
+        async def download_to_drive(path: str) -> None:
+            Path(path).write_bytes(b"fake image")
+
+        file_obj = MagicMock()
+        file_obj.download_to_drive = AsyncMock(side_effect=download_to_drive)
+        message.get_bot.return_value.get_file.return_value = file_obj
+
+        with (
+            patch(
+                "ccgram.handlers.file_handler.resolve_pending_codex_attachment_target",
+                new_callable=AsyncMock,
+                return_value=SimpleNamespace(
+                    cwd=str(tmp_path),
+                    app_server_thread_id="thread-1",
+                    session_id="sess-1",
+                ),
+            ),
+            patch(
+                "ccgram.handlers.file_handler.submit_attachment_to_pending_codex_topic",
+                new_callable=AsyncMock,
+                return_value=PendingCodexAction("submitted", message="turn-1"),
+            ) as mock_submit,
+            patch(
+                "ccgram.handlers.file_handler.ack_reaction",
+                new_callable=AsyncMock,
+            ) as mock_ack,
+            patch(
+                "ccgram.handlers.file_handler.safe_reply",
+                new_callable=AsyncMock,
+            ) as mock_reply,
+            patch(
+                "ccgram.handlers.file_handler.send_to_window",
+                new_callable=AsyncMock,
+            ) as mock_send_to_window,
+        ):
+            await _upload_and_notify(
+                message,
+                100,
+                77,
+                "shot.jpg",
+                "file-id",
+                123,
+                "Photo",
+                "I've uploaded an image to {path} — please take a look.",
+                "\U0001f4f7",
+                app_server_input_kind="image",
+            )
+
+        saved_path = tmp_path / ".ccgram-uploads" / "shot.jpg"
+        assert saved_path.read_bytes() == b"fake image"
+        mock_submit.assert_awaited_once_with(
+            100,
+            77,
+            -100999,
+            "I've uploaded an image to .ccgram-uploads/shot.jpg — please take a look.\n\n"
+            "User note: check this",
+            extra_input=[{"type": "localImage", "path": str(saved_path)}],
+        )
+        mock_send_to_window.assert_not_awaited()
+        mock_ack.assert_awaited_once_with(message.get_bot.return_value, -100999, 500)
+        assert "Uploaded `.ccgram-uploads/shot.jpg`" in mock_reply.call_args.args[1]
+
+    async def test_tmux_upload_path_still_notifies_bound_window(
+        self, tmp_path: Path
+    ) -> None:
+        message = self._message()
+
+        async def download_to_drive(path: str) -> None:
+            Path(path).write_bytes(b"report")
+
+        file_obj = MagicMock()
+        file_obj.download_to_drive = AsyncMock(side_effect=download_to_drive)
+        message.get_bot.return_value.get_file.return_value = file_obj
+
+        with (
+            patch(
+                "ccgram.handlers.file_handler.resolve_pending_codex_attachment_target",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch("ccgram.handlers.file_handler.thread_router") as mock_tr,
+            patch("ccgram.handlers.file_handler.view_window") as mock_view_window,
+            patch(
+                "ccgram.handlers.file_handler.send_to_window",
+                new_callable=AsyncMock,
+                return_value=(True, ""),
+            ) as mock_send_to_window,
+            patch(
+                "ccgram.handlers.file_handler.submit_attachment_to_pending_codex_topic",
+                new_callable=AsyncMock,
+            ) as mock_submit,
+            patch(
+                "ccgram.handlers.file_handler.ack_reaction",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "ccgram.handlers.file_handler.safe_reply",
+                new_callable=AsyncMock,
+            ),
+        ):
+            mock_tr.resolve_window_for_thread.return_value = "@11"
+            mock_view_window.return_value = SimpleNamespace(cwd=str(tmp_path))
+
+            await _upload_and_notify(
+                message,
+                100,
+                77,
+                "report.pdf",
+                "file-id",
+                123,
+                "File",
+                "I've uploaded {name} to {path}",
+                "\U0001f4ce",
+                app_server_input_kind="file",
+            )
+
+        mock_send_to_window.assert_awaited_once_with(
+            "@11",
+            "I've uploaded report.pdf to .ccgram-uploads/report.pdf",
+        )
+        mock_submit.assert_not_awaited()

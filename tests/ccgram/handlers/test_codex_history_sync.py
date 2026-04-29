@@ -16,6 +16,8 @@ from ccgram.handlers.codex_history_sync import (
     _save_state,
     activate_pending_codex_topic,
     rename_app_server_synced_topic,
+    resolve_pending_codex_attachment_target,
+    submit_attachment_to_pending_codex_topic,
     submit_or_activate_pending_codex_topic,
     sync_codex_history_once,
 )
@@ -561,6 +563,76 @@ async def test_pending_topic_submits_to_app_server_without_tmux_resume(tmp_path)
     updated = state.pending_topics["100:77"]
     assert updated.submitted_prompt_echoes == ("continue from mobile",)
     assert updated.app_server_thread_id == "thread-1"
+
+
+async def test_resolve_pending_codex_attachment_target(tmp_path) -> None:
+    pending = PendingCodexTopic(
+        session_id="sess-1",
+        summary="reply hello",
+        cwd="/tmp/project",
+        transcript_path="/tmp/session.jsonl",
+        user_id=100,
+        chat_id=-100999,
+        thread_id=77,
+        topic_name="reply hello - project",
+        created_at=1.0,
+        app_server_thread_id="thread-1",
+    )
+
+    with patch(f"{_CHS}.config", _config(tmp_path)):
+        _save_state(CodexHistoryState(True, {"sess-1"}, {"100:77": pending}))
+        target = await resolve_pending_codex_attachment_target(100, 77)
+
+    assert target is not None
+    assert target.cwd == "/tmp/project"
+    assert target.app_server_thread_id == "thread-1"
+
+
+async def test_attachment_to_pending_topic_submits_extra_input(tmp_path) -> None:
+    pending = PendingCodexTopic(
+        session_id="sess-1",
+        summary="reply hello",
+        cwd="/tmp/project",
+        transcript_path="/tmp/session.jsonl",
+        user_id=100,
+        chat_id=-100999,
+        thread_id=77,
+        topic_name="reply hello - project",
+        created_at=1.0,
+        app_server_thread_id="thread-1",
+    )
+    extra_input = [{"type": "localImage", "path": "/tmp/project/shot.jpg"}]
+
+    with (
+        patch(f"{_CHS}.config", _config(tmp_path)),
+        patch(f"{_CHS}.thread_router") as mock_tr,
+        patch(f"{_CHS}.submit_turn_to_app_server", new=AsyncMock()) as mock_submit,
+    ):
+        mock_submit.return_value = CodexTurnSubmission("thread-1", "turn-1")
+        _save_state(CodexHistoryState(True, {"sess-1"}, {"100:77": pending}))
+
+        action = await submit_attachment_to_pending_codex_topic(
+            100,
+            77,
+            -100999,
+            "Please inspect .ccgram-uploads/shot.jpg",
+            extra_input=extra_input,
+        )
+        state = _load_state()
+
+    assert action.status == "submitted"
+    mock_submit.assert_awaited_once_with(
+        "ws://127.0.0.1:9234",
+        "thread-1",
+        "Please inspect .ccgram-uploads/shot.jpg",
+        timeout=2.0,
+        extra_input=extra_input,
+    )
+    mock_tr.set_group_chat_id.assert_called_once_with(100, 77, -100999)
+    updated = state.pending_topics["100:77"]
+    assert updated.submitted_prompt_echoes == (
+        "Please inspect .ccgram-uploads/shot.jpg",
+    )
 
 
 async def test_pending_topic_busy_does_not_fall_back_to_tmux(tmp_path) -> None:
