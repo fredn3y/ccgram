@@ -219,6 +219,7 @@ async def sync_codex_history_once(bot: Bot) -> None:
         state = _load_state()
         if state.pending_topics:
             await _sync_pending_history(bot, state)
+            _save_state(state)
 
         if not sessions:
             _sync_bound_codex_topics(state, {}, target)
@@ -372,7 +373,7 @@ async def _sync_app_server_thread_names(
             thread_ids,
             timeout=config.codex_app_server_timeout,
         )
-    except CodexAppServerError as exc:
+    except (CodexAppServerError, TimeoutError) as exc:
         logger.debug("Codex app-server title sync skipped: %s", exc)
         return
 

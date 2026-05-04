@@ -138,14 +138,23 @@ class CodexAppServerClient:
     async def _send(self, payload: dict[str, Any]) -> None:
         if self._ws is None:
             raise CodexAppServerUnavailableError("websocket is not connected")
-        await asyncio.wait_for(self._ws.send(json.dumps(payload)), timeout=self.timeout)
+        try:
+            await asyncio.wait_for(
+                self._ws.send(json.dumps(payload)),
+                timeout=self.timeout,
+            )
+        except (OSError, TimeoutError, WebSocketException) as exc:
+            raise CodexAppServerUnavailableError(str(exc)) from exc
 
     async def _recv_response(self, request_id: int) -> Any:
         if self._ws is None:
             raise CodexAppServerUnavailableError("websocket is not connected")
 
         while True:
-            raw = await asyncio.wait_for(self._ws.recv(), timeout=self.timeout)
+            try:
+                raw = await asyncio.wait_for(self._ws.recv(), timeout=self.timeout)
+            except (OSError, TimeoutError, WebSocketException) as exc:
+                raise CodexAppServerUnavailableError(str(exc)) from exc
             try:
                 message = json.loads(raw)
             except (TypeError, json.JSONDecodeError) as exc:

@@ -5,6 +5,7 @@ import pytest
 from ccgram.codex_app_server import (
     CodexAppServerBusyError,
     CodexAppServerClient,
+    CodexAppServerUnavailableError,
     read_thread_names_from_app_server,
 )
 
@@ -23,6 +24,13 @@ class FakeWebSocket:
 
     async def close(self) -> None:
         self.closed = True
+
+
+class TimeoutAfterResponsesWebSocket(FakeWebSocket):
+    async def recv(self) -> str:
+        if self.responses:
+            return await super().recv()
+        raise TimeoutError
 
 
 async def test_submit_turn_resumes_not_loaded_thread_before_turn_start(
@@ -148,6 +156,27 @@ async def test_overloaded_request_is_retried(monkeypatch) -> None:
 
     methods = [sent["method"] for sent in socket.sent]
     assert methods == ["initialize", "initialized", "thread/list", "thread/list"]
+
+
+async def test_request_timeout_is_reported_as_app_server_unavailable(
+    monkeypatch,
+) -> None:
+    socket = TimeoutAfterResponsesWebSocket(
+        [{"id": 1, "result": {"serverInfo": {"name": "codex"}}}]
+    )
+
+    async def fake_connect(*_args, **_kwargs) -> FakeWebSocket:
+        return socket
+
+    monkeypatch.setattr("ccgram.codex_app_server.connect", fake_connect)
+
+    async with CodexAppServerClient("ws://127.0.0.1:9234") as client:
+        with pytest.raises(CodexAppServerUnavailableError):
+            await client.list_threads()
+
+    methods = [sent["method"] for sent in socket.sent]
+    assert methods == ["initialize", "initialized", "thread/list"]
+    assert socket.closed is True
 
 
 async def test_set_thread_name_sends_thread_name_set(monkeypatch) -> None:
