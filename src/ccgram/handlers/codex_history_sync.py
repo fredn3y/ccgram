@@ -255,6 +255,7 @@ async def sync_codex_history_once(bot: Bot) -> None:
                 state.pending_topics[key] = topic
                 state.seen_session_ids.add(entry.session_id)
 
+        _save_state(state)
         await _sync_app_server_thread_names(bot, state)
         _save_state(state)
 

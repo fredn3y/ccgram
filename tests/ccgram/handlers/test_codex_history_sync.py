@@ -116,6 +116,39 @@ async def test_scan_creates_lazy_topic_for_new_codex_session(tmp_path) -> None:
     assert "Add mobile bridge" in mock_safe_send.call_args.args[2]
 
 
+async def test_new_topic_state_saved_before_title_sync(tmp_path) -> None:
+    cwd = tmp_path / "second-brain"
+    cwd.mkdir()
+    transcript = tmp_path / "new.jsonl"
+    _write_transcript(
+        transcript,
+        '{"type":"event_msg","payload":{"type":"user_message","message":"Add mobile bridge"}}',
+    )
+    entry = ResumeEntry("sess-new", "Add mobile bridge", str(cwd), str(transcript))
+    bot = _bot(thread_id=88)
+
+    async def assert_state_saved(*_args) -> None:
+        state = _load_state()
+        assert "100:88" in state.pending_topics
+        assert state.seen_session_ids == {"sess-new"}
+
+    with (
+        patch(f"{_CHS}.config", _config(tmp_path)),
+        patch(f"{_CHS}._bound_session_ids", return_value=set()),
+        patch(f"{_CHS}.scan_all_sessions", return_value=[entry]),
+        patch(f"{_CHS}.safe_send", new=AsyncMock()) as mock_safe_send,
+        patch(
+            f"{_CHS}._sync_app_server_thread_names",
+            new=AsyncMock(side_effect=assert_state_saved),
+        ),
+    ):
+        mock_safe_send.return_value = MagicMock()
+        _save_state(CodexHistoryState(True, set(), {}))
+        await sync_codex_history_once(bot)
+
+    bot.create_forum_topic.assert_awaited_once()
+
+
 async def test_scan_marks_bound_sessions_seen_without_duplicate_topic(tmp_path) -> None:
     cwd = tmp_path / "second-brain"
     cwd.mkdir()
