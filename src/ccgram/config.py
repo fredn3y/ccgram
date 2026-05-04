@@ -226,9 +226,7 @@ class Config:
             app_server_raw not in ("0", "false", "no", "off")
             and self.provider_name.lower() == "codex"
         )
-        self.codex_app_server_url = os.getenv(
-            "CCGRAM_CODEX_APP_SERVER_URL", "ws://127.0.0.1:9234"
-        )
+        self.codex_app_server_url = os.getenv("CCGRAM_CODEX_APP_SERVER_URL", "unix://")
         try:
             self.codex_app_server_timeout = max(
                 0.5,

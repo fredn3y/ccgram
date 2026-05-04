@@ -6,6 +6,7 @@ from ccgram.codex_app_server import (
     CodexAppServerBusyError,
     CodexAppServerClient,
     CodexAppServerUnavailableError,
+    _unix_socket_path_from_url,
     read_thread_names_from_app_server,
 )
 
@@ -31,6 +32,46 @@ class TimeoutAfterResponsesWebSocket(FakeWebSocket):
         if self.responses:
             return await super().recv()
         raise TimeoutError
+
+
+async def test_unix_url_connects_to_codex_control_socket(monkeypatch, tmp_path) -> None:
+    socket = FakeWebSocket([{"id": 1, "result": {"serverInfo": {"name": "codex"}}}])
+    socket_path = tmp_path / "app-server.sock"
+    calls: list[dict] = []
+
+    async def fake_unix_connect(path: str, **kwargs) -> FakeWebSocket:
+        calls.append({"path": path, **kwargs})
+        return socket
+
+    async def fake_connect(*_args, **_kwargs):
+        raise AssertionError("websocket TCP connect should not be used")
+
+    monkeypatch.setattr("ccgram.codex_app_server.unix_connect", fake_unix_connect)
+    monkeypatch.setattr("ccgram.codex_app_server.connect", fake_connect)
+
+    async with CodexAppServerClient(f"unix://{socket_path}") as client:
+        assert client.url == f"unix://{socket_path}"
+
+    assert calls == [
+        {
+            "path": str(socket_path),
+            "uri": "ws://localhost/rpc",
+            "open_timeout": 3.0,
+            "close_timeout": 3.0,
+            "compression": None,
+            "user_agent_header": None,
+        }
+    ]
+    assert [sent["method"] for sent in socket.sent] == ["initialize", "initialized"]
+    assert socket.closed is True
+
+
+def test_default_unix_url_resolves_to_codex_home(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+
+    assert _unix_socket_path_from_url("unix://") == str(
+        tmp_path / "app-server-control" / "app-server-control.sock"
+    )
 
 
 async def test_submit_turn_resumes_not_loaded_thread_before_turn_start(

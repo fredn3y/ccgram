@@ -8,17 +8,21 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import random
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
-from websockets.asyncio.client import connect
+from websockets.asyncio.client import connect, unix_connect
 from websockets.exceptions import WebSocketException
 
 from . import __version__
 
 _OVERLOADED_ERROR_CODE = -32001
 _OVERLOADED_RETRIES = 3
+_DEFAULT_UNIX_SOCKET_RELATIVE = "app-server-control/app-server-control.sock"
+_UNIX_SOCKET_WEBSOCKET_URI = "ws://localhost/rpc"
 
 
 class CodexAppServerError(Exception):
@@ -26,7 +30,7 @@ class CodexAppServerError(Exception):
 
 
 class CodexAppServerUnavailableError(CodexAppServerError):
-    """The app-server websocket could not be reached."""
+    """The app-server transport could not be reached."""
 
 
 class CodexAppServerProtocolError(CodexAppServerError):
@@ -56,7 +60,7 @@ class CodexTurnSubmission:
 
 
 class CodexAppServerClient:
-    """Tiny JSON-RPC websocket client for Codex app-server."""
+    """Tiny JSON-RPC client for Codex app-server websocket transports."""
 
     def __init__(self, url: str, *, timeout: float = 3.0) -> None:
         self.url = url
@@ -67,11 +71,7 @@ class CodexAppServerClient:
     async def __aenter__(self) -> CodexAppServerClient:
         try:
             self._ws = await asyncio.wait_for(
-                connect(
-                    self.url,
-                    open_timeout=self.timeout,
-                    close_timeout=self.timeout,
-                ),
+                self._connect(),
                 timeout=self.timeout,
             )
         except (OSError, TimeoutError, ValueError, WebSocketException) as exc:
@@ -83,6 +83,22 @@ class CodexAppServerClient:
     async def __aexit__(self, *_exc: object) -> None:
         if self._ws is not None:
             await self._ws.close()
+
+    async def _connect(self) -> Any:
+        if self.url.startswith("unix://"):
+            return await unix_connect(
+                _unix_socket_path_from_url(self.url),
+                uri=_UNIX_SOCKET_WEBSOCKET_URI,
+                open_timeout=self.timeout,
+                close_timeout=self.timeout,
+                compression=None,
+                user_agent_header=None,
+            )
+        return await connect(
+            self.url,
+            open_timeout=self.timeout,
+            close_timeout=self.timeout,
+        )
 
     async def _initialize(self) -> None:
         await self._request(
@@ -137,7 +153,7 @@ class CodexAppServerClient:
 
     async def _send(self, payload: dict[str, Any]) -> None:
         if self._ws is None:
-            raise CodexAppServerUnavailableError("websocket is not connected")
+            raise CodexAppServerUnavailableError("app-server transport is not connected")
         try:
             await asyncio.wait_for(
                 self._ws.send(json.dumps(payload)),
@@ -148,7 +164,7 @@ class CodexAppServerClient:
 
     async def _recv_response(self, request_id: int) -> Any:
         if self._ws is None:
-            raise CodexAppServerUnavailableError("websocket is not connected")
+            raise CodexAppServerUnavailableError("app-server transport is not connected")
 
         while True:
             try:
@@ -363,6 +379,14 @@ def _status_type(thread: dict[str, Any]) -> str:
     if isinstance(status, str):
         return status
     return ""
+
+
+def _unix_socket_path_from_url(url: str) -> str:
+    raw_path = url.removeprefix("unix://")
+    if not raw_path:
+        codex_home = Path(os.getenv("CODEX_HOME") or Path.home() / ".codex")
+        return str(codex_home / _DEFAULT_UNIX_SOCKET_RELATIVE)
+    return str(Path(raw_path).expanduser())
 
 
 def _looks_busy(message: str) -> bool:

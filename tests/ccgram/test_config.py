@@ -12,6 +12,7 @@ def _base_env(monkeypatch, tmp_path):
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test:token")
     monkeypatch.setenv("ALLOWED_USERS", "12345")
     monkeypatch.setenv("CCGRAM_DIR", str(tmp_path))
+    monkeypatch.delenv("CCGRAM_GROUP_ID", raising=False)
 
 
 @pytest.mark.usefixtures("_base_env")
@@ -72,7 +73,7 @@ class TestCodexAppServerConfig:
         cfg = Config()
         assert cfg.provider_name == "claude"
         assert cfg.codex_app_server_enabled is False
-        assert cfg.codex_app_server_url == "ws://127.0.0.1:9234"
+        assert cfg.codex_app_server_url == "unix://"
         assert cfg.codex_app_server_timeout == 3.0
 
     def test_auto_enabled_for_codex_provider(self, monkeypatch):
