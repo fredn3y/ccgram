@@ -23,6 +23,7 @@ from telegram import Bot, CallbackQuery, LinkPreviewOptions, Message, ReactionTy
 from telegram.error import BadRequest, RetryAfter, TelegramError
 
 from ..entity_formatting import convert_to_entities
+from ..telegram_sender import split_message, split_rendered_message
 
 logger = structlog.get_logger()
 
@@ -53,6 +54,7 @@ def _retry_after_seconds(exc: RetryAfter) -> int:
 _last_send_time: dict[int, float] = {}
 _rate_limit_locks: dict[int, asyncio.Lock] = {}
 MESSAGE_SEND_INTERVAL = 0.5  # seconds between messages to same chat
+PLAIN_FALLBACK_CHUNK_LENGTH = 3500
 
 
 async def rate_limit_send(chat_id: int) -> None:
@@ -77,6 +79,8 @@ async def _with_entity_fallback(
     send_fn: Callable[..., Awaitable[Any]],
     text: str,
     context_label: str,
+    *,
+    allow_split: bool = True,
     **kwargs: Any,
 ) -> Message | None:
     """Convert to entities, send, fall back to plain text on error.
@@ -118,8 +122,85 @@ async def _with_entity_fallback(
             last_error = e
 
     if last_error is not None:
+        if allow_split and _can_split_send(context_label) and _is_message_too_long(last_error):
+            return await _send_split_messages(send_fn, text, context_label, **kwargs)
         logger.warning("Failed to %s: %s", context_label, last_error)
     return None
+
+
+def _can_split_send(context_label: str) -> bool:
+    return not context_label.startswith("edit")
+
+
+def _is_message_too_long(exc: TelegramError) -> bool:
+    return "message is too long" in str(exc).lower()
+
+
+async def _send_split_messages(
+    send_fn: Callable[..., Awaitable[Any]],
+    text: str,
+    context_label: str,
+    **kwargs: Any,
+) -> Message | None:
+    sent: Message | None = None
+    chunks = split_rendered_message(text)
+    if len(chunks) <= 1:
+        return await _send_plain_chunks(send_fn, text, context_label, **kwargs)
+
+    logger.info(
+        "Splitting overlong Telegram message for %s into %d chunks",
+        context_label,
+        len(chunks),
+    )
+    for index, chunk in enumerate(chunks):
+        sent = await _with_entity_fallback(
+            send_fn,
+            chunk,
+            context_label,
+            allow_split=False,
+            **kwargs,
+        )
+        if sent is None:
+            remaining_text = "\n".join(chunks[index:])
+            return await _send_plain_chunks(send_fn, remaining_text, context_label, **kwargs)
+    return sent
+
+
+async def _send_plain_chunks(
+    send_fn: Callable[..., Awaitable[Any]],
+    text: str,
+    context_label: str,
+    **kwargs: Any,
+) -> Message | None:
+    plain_text, _entities = convert_to_entities(text)
+    chunks = split_message(plain_text, max_length=PLAIN_FALLBACK_CHUNK_LENGTH)
+    if not chunks:
+        return None
+
+    logger.info(
+        "Sending overlong Telegram message for %s as %d plain chunk(s)",
+        context_label,
+        len(chunks),
+    )
+    sent: Message | None = None
+    for chunk in chunks:
+        try:
+            sent = await send_fn(chunk, **kwargs)
+        except RetryAfter as exc:
+            await asyncio.sleep(_retry_after_seconds(exc) + 1)
+            try:
+                sent = await send_fn(chunk, **kwargs)
+            except TelegramError as retry_exc:
+                if is_thread_gone(retry_exc):
+                    return None
+                logger.warning("Failed to %s: %s", context_label, retry_exc)
+                return None
+        except TelegramError as exc:
+            if is_thread_gone(exc):
+                return None
+            logger.warning("Failed to %s: %s", context_label, exc)
+            return None
+    return sent
 
 
 async def _send_with_fallback(

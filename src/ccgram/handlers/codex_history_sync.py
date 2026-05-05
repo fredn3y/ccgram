@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -22,7 +23,7 @@ from ..codex_app_server import (
 from ..config import config
 from ..session import session_manager
 from ..thread_router import thread_router
-from ..telegram_sender import split_message
+from ..telegram_sender import split_rendered_message
 from ..tmux_manager import tmux_manager
 from ..utils import atomic_write_json, task_done_callback
 from .message_sender import safe_send
@@ -34,6 +35,7 @@ logger = structlog.get_logger()
 
 _state_lock = asyncio.Lock()
 _TELEGRAM_TOPIC_NAME_MAX = 128
+_HISTORY_CHUNKS_PER_SYNC = 20
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +90,7 @@ class CodexHistoryEntry:
     role: str
     text: str
     formatted: str
+    end_offset: int = 0
 
 
 def _topic_key(user_id: int, thread_id: int) -> str:
@@ -490,12 +493,14 @@ async def _sync_pending_history(bot: Bot, state: CodexHistoryState) -> None:
     """Send newly available Codex transcript messages into pending topics."""
     for key, pending in list(state.pending_topics.items()):
         state.pending_topics[key] = await _send_pending_history(bot, pending)
+        _save_state(state)
 
 
 async def _send_pending_history(
     bot: Bot,
     pending: PendingCodexTopic,
 ) -> PendingCodexTopic:
+    pending = _refresh_pending_transcript_path(pending)
     entries, new_offset = _read_codex_event_history_entries(
         pending.transcript_path,
         pending.history_offset,
@@ -504,6 +509,7 @@ async def _send_pending_history(
         return pending
 
     submitted_prompt_echoes = pending.submitted_prompt_echoes
+    sent_chunks = 0
     for entry in entries:
         if entry.role == "user":
             matched, submitted_prompt_echoes = _consume_submitted_prompt_echo(
@@ -511,9 +517,14 @@ async def _send_pending_history(
                 entry.text,
             )
             if matched:
+                pending = replace(
+                    pending,
+                    history_offset=entry.end_offset or pending.history_offset,
+                    submitted_prompt_echoes=submitted_prompt_echoes,
+                )
                 continue
 
-        for chunk in split_message(entry.formatted, max_length=3900):
+        for chunk in split_rendered_message(entry.formatted):
             sent = await safe_send(
                 bot,
                 pending.chat_id,
@@ -523,12 +534,89 @@ async def _send_pending_history(
             )
             if sent is None:
                 return pending
+            sent_chunks += 1
+
+        pending = replace(
+            pending,
+            history_offset=entry.end_offset or pending.history_offset,
+            submitted_prompt_echoes=submitted_prompt_echoes,
+        )
+        if sent_chunks >= _HISTORY_CHUNKS_PER_SYNC:
+            return pending
 
     return replace(
         pending,
         history_offset=new_offset,
         submitted_prompt_echoes=submitted_prompt_echoes,
     )
+
+
+def _refresh_pending_transcript_path(pending: PendingCodexTopic) -> PendingCodexTopic:
+    transcript_path = Path(pending.transcript_path).expanduser()
+    if transcript_path.exists():
+        return pending
+
+    resolved_path = _find_codex_transcript_path(
+        pending.session_id,
+        transcript_path.name,
+    )
+    if resolved_path is None:
+        return pending
+
+    history_offset = pending.history_offset
+    try:
+        size = resolved_path.stat().st_size
+    except OSError:
+        size = history_offset
+    if history_offset > size:
+        history_offset = size
+
+    logger.info(
+        "Resolved moved Codex transcript for topic %d: %s",
+        pending.thread_id,
+        resolved_path,
+    )
+    return replace(
+        pending,
+        transcript_path=str(resolved_path),
+        history_offset=history_offset,
+    )
+
+
+def _find_codex_transcript_path(session_id: str, filename: str) -> Path | None:
+    codex_home = _codex_home()
+    candidates: list[Path] = []
+    if filename:
+        candidates.append(codex_home / "archived_sessions" / filename)
+
+    for root in (codex_home / "sessions", codex_home / "archived_sessions"):
+        if not root.exists():
+            continue
+        try:
+            candidates.extend(root.rglob(f"*{session_id}*.jsonl"))
+        except OSError:
+            continue
+
+    seen: set[Path] = set()
+    existing: list[Path] = []
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if candidate.is_file():
+            existing.append(candidate)
+    if not existing:
+        return None
+
+    existing.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    return existing[0]
+
+
+def _codex_home() -> Path:
+    raw_home = os.getenv("CODEX_HOME")
+    if raw_home:
+        return Path(raw_home).expanduser()
+    return Path.home() / ".codex"
 
 
 def _read_codex_event_history(
@@ -554,7 +642,7 @@ def _read_codex_event_history_entries(
                 offset += len(raw_line)
                 entry = _parse_codex_event_history_entry(raw_line)
                 if entry is not None:
-                    entries.append(entry)
+                    entries.append(replace(entry, end_offset=offset))
     except OSError:
         return [], start_offset
     return entries, offset

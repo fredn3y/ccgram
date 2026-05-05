@@ -359,6 +359,66 @@ async def test_pending_history_offset_survives_title_sync_timeout(
     assert state.pending_topics["100:77"].history_offset == transcript.stat().st_size
 
 
+async def test_pending_history_resolves_archived_transcript_path(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    codex_home = tmp_path / "codex"
+    missing_transcript = (
+        codex_home
+        / "sessions"
+        / "2026"
+        / "04"
+        / "30"
+        / "rollout-2026-04-30T12-54-25-sess-1.jsonl"
+    )
+    archived_transcript = codex_home / "archived_sessions" / missing_transcript.name
+    archived_transcript.parent.mkdir(parents=True)
+
+    user_line = (
+        '{"type":"event_msg","payload":{"type":"user_message",'
+        '"message":"mobile prompt"}}'
+    )
+    agent_line = (
+        '{"type":"event_msg","payload":{"type":"agent_message",'
+        '"message":"archived hello"}}'
+    )
+    _write_transcript(archived_transcript, user_line)
+    first_offset = archived_transcript.stat().st_size
+    _write_transcript(archived_transcript, user_line, agent_line)
+
+    pending = PendingCodexTopic(
+        session_id="sess-1",
+        summary="mobile prompt",
+        cwd="/tmp/project",
+        transcript_path=str(missing_transcript),
+        user_id=100,
+        chat_id=-100999,
+        thread_id=77,
+        topic_name="mobile prompt - project",
+        created_at=1.0,
+        history_offset=first_offset,
+    )
+    bot = _bot()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    with (
+        patch(f"{_CHS}.config", _config(tmp_path)),
+        patch(f"{_CHS}.scan_all_sessions", return_value=[]),
+        patch(f"{_CHS}.safe_send", new=AsyncMock()) as mock_safe_send,
+    ):
+        mock_safe_send.return_value = MagicMock()
+        _save_state(CodexHistoryState(True, {"sess-1"}, {"100:77": pending}))
+        await sync_codex_history_once(bot)
+        state = _load_state()
+
+    mock_safe_send.assert_awaited_once()
+    assert mock_safe_send.call_args.args[2] == "archived hello"
+    updated = state.pending_topics["100:77"]
+    assert updated.transcript_path == str(archived_transcript)
+    assert updated.history_offset == archived_transcript.stat().st_size
+
+
 async def test_pending_topic_skips_app_server_submitted_user_echo(tmp_path) -> None:
     transcript = tmp_path / "session.jsonl"
     first_line = (

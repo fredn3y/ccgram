@@ -104,6 +104,75 @@ class TestSendWithFallback:
         result = await _send_with_fallback(bot, 123, "hello")
         assert result is None
 
+    async def test_message_too_long_retries_split_chunks(self) -> None:
+        bot = AsyncMock()
+        first = AsyncMock(spec=Message)
+        second = AsyncMock(spec=Message)
+        bot.send_message.side_effect = [
+            TelegramError("Message is too long"),
+            TelegramError("Message is too long"),
+            first,
+            second,
+        ]
+
+        with patch(
+            "ccgram.handlers.message_sender.split_rendered_message",
+            return_value=["first", "second"],
+        ):
+            result = await _send_with_fallback(bot, 123, "overlong")
+
+        assert result is second
+        assert bot.send_message.call_count == 4
+        assert bot.send_message.call_args_list[2].kwargs["text"] == "first"
+        assert bot.send_message.call_args_list[3].kwargs["text"] == "second"
+
+    async def test_message_too_long_plain_chunk_fallback(self) -> None:
+        bot = AsyncMock()
+        sent = AsyncMock(spec=Message)
+        bot.send_message.side_effect = [
+            TelegramError("Message is too long"),
+            TelegramError("Message is too long"),
+            sent,
+        ]
+
+        with patch(
+            "ccgram.handlers.message_sender.split_rendered_message",
+            return_value=["overlong"],
+        ):
+            result = await _send_with_fallback(bot, 123, "overlong")
+
+        assert result is sent
+        assert bot.send_message.call_count == 3
+        plain_kwargs = bot.send_message.call_args_list[2].kwargs
+        assert plain_kwargs["text"] == "overlong"
+        assert "entities" not in plain_kwargs
+
+    async def test_split_chunk_failure_sends_remaining_plain_chunks(self) -> None:
+        bot = AsyncMock()
+        first = AsyncMock(spec=Message)
+        fallback = AsyncMock(spec=Message)
+        bot.send_message.side_effect = [
+            TelegramError("Message is too long"),
+            TelegramError("Message is too long"),
+            first,
+            TelegramError("entity chunk fail"),
+            TelegramError("plain chunk fail"),
+            fallback,
+        ]
+
+        with patch(
+            "ccgram.handlers.message_sender.split_rendered_message",
+            return_value=["first", "second", "third"],
+        ):
+            result = await _send_with_fallback(bot, 123, "overlong")
+
+        assert result is fallback
+        assert bot.send_message.call_count == 6
+        assert bot.send_message.call_args_list[2].kwargs["text"] == "first"
+        fallback_kwargs = bot.send_message.call_args_list[5].kwargs
+        assert fallback_kwargs["text"] == "second\nthird"
+        assert "entities" not in fallback_kwargs
+
     async def test_retry_after_sleeps_and_retries(self) -> None:
         bot = AsyncMock()
         sent = AsyncMock(spec=Message)

@@ -1,6 +1,7 @@
 import pytest
 
-from ccgram.telegram_sender import split_message
+from ccgram import telegram_sender
+from ccgram.telegram_sender import split_message, split_rendered_message
 
 
 class TestSplitMessage:
@@ -77,3 +78,15 @@ class TestSplitMessage:
         chunks = split_message(text, max_length=200)
         for chunk in chunks:
             assert len(chunk) <= 200
+
+    def test_split_rendered_message_rechecks_rendered_length(self, monkeypatch):
+        monkeypatch.setattr(
+            telegram_sender,
+            "_rendered_length",
+            lambda text: len(text) * 2,
+        )
+
+        chunks = split_rendered_message("a" * 3900)
+
+        assert len(chunks) == 2
+        assert all(len(chunk) * 2 <= 3900 for chunk in chunks)
