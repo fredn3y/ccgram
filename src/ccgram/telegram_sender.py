@@ -51,7 +51,9 @@ def split_rendered_message(
     """Split text by Telegram's final rendered length after entity conversion."""
     chunks: list[str] = []
     for chunk in split_message(text, max_length=max_length):
-        chunks.extend(_split_chunk_by_rendered_size(chunk, max_length))
+        for rendered_chunk in _split_chunk_by_rendered_size(chunk, max_length):
+            if _has_rendered_text(rendered_chunk):
+                chunks.append(rendered_chunk)
     return chunks
 
 
@@ -98,7 +100,15 @@ def _largest_rendered_prefix(text: str, max_length: int) -> int:
 def _rendered_length(text: str) -> int:
     from telegramify_markdown import utf16_len
 
+    return utf16_len(_rendered_text(text))
+
+
+def _has_rendered_text(text: str) -> bool:
+    return bool(_rendered_text(text).strip())
+
+
+def _rendered_text(text: str) -> str:
     from .entity_formatting import convert_to_entities
 
     plain_text, _entities = convert_to_entities(text)
-    return utf16_len(plain_text)
+    return plain_text

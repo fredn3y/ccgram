@@ -90,3 +90,6 @@ class TestSplitMessage:
 
         assert len(chunks) == 2
         assert all(len(chunk) * 2 <= 3900 for chunk in chunks)
+
+    def test_split_rendered_message_filters_rendered_empty_chunks(self):
+        assert split_rendered_message("```") == []

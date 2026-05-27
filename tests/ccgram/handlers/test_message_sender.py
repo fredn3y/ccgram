@@ -82,6 +82,14 @@ class TestSendWithFallback:
         assert "entities" in call_kwargs
         assert "parse_mode" not in call_kwargs
 
+    async def test_rendered_empty_text_is_not_sent(self) -> None:
+        bot = AsyncMock()
+
+        result = await _send_with_fallback(bot, 123, "```")
+
+        assert result is None
+        bot.send_message.assert_not_called()
+
     async def test_fallback_to_plain(self) -> None:
         bot = AsyncMock()
         sent = AsyncMock(spec=Message)

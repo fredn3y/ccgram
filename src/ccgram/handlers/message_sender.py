@@ -98,7 +98,31 @@ async def _with_entity_fallback(
     Returns the result Message on success, None on failure.
     """
     plain_text, entities = convert_to_entities(text)
+    if not plain_text.strip():
+        logger.debug("Skipping %s: rendered text is empty", context_label)
+        return None
 
+    return await _send_nonempty_with_entity_fallback(
+        send_fn,
+        plain_text,
+        entities,
+        text,
+        context_label,
+        allow_split=allow_split,
+        **kwargs,
+    )
+
+
+async def _send_nonempty_with_entity_fallback(
+    send_fn: Callable[..., Awaitable[Any]],
+    plain_text: str,
+    entities: Any,
+    raw_text: str,
+    context_label: str,
+    *,
+    allow_split: bool = True,
+    **kwargs: Any,
+) -> Message | None:
     # Phase 1: with entities; Phase 2: plain text fallback.
     # Thread-gone errors (deleted topic) short-circuit both phases.
     last_error: TelegramError | None = None
@@ -123,7 +147,7 @@ async def _with_entity_fallback(
 
     if last_error is not None:
         if allow_split and _can_split_send(context_label) and _is_message_too_long(last_error):
-            return await _send_split_messages(send_fn, text, context_label, **kwargs)
+            return await _send_split_messages(send_fn, raw_text, context_label, **kwargs)
         logger.warning("Failed to %s: %s", context_label, last_error)
     return None
 
