@@ -59,6 +59,7 @@ from .handlers.command_orchestration import (
     sync_scoped_provider_menu as _sync_scoped_provider_menu,
     setup_menu_refresh_job,
 )
+from .handlers.claude_history_sync import start_claude_history_sync
 from .handlers.codex_history_sync import start_codex_history_sync
 from .handlers.callback_helpers import get_thread_id as _get_thread_id
 from .handlers.callback_registry import dispatch as _dispatch_callback
@@ -106,6 +107,7 @@ session_monitor: SessionMonitor | None = None
 # Status polling task
 _status_poll_task: asyncio.Task | None = None
 _codex_history_sync_task: asyncio.Task | None = None
+_claude_history_sync_task: asyncio.Task | None = None
 
 
 def is_user_allowed(user_id: int | None) -> bool:
@@ -365,7 +367,7 @@ def _global_exception_handler(
 
 
 async def post_init(application: Application) -> None:
-    global session_monitor, _status_poll_task, _codex_history_sync_task
+    global session_monitor, _status_poll_task
 
     # Install global asyncio exception handler as safety net
     asyncio.get_running_loop().set_exception_handler(_global_exception_handler)
@@ -467,9 +469,20 @@ async def post_init(application: Application) -> None:
     _status_poll_task.add_done_callback(task_done_callback)
     logger.info("Status polling task started")
 
+    _start_history_sync_tasks(application)
+
+
+def _start_history_sync_tasks(application: Application) -> None:
+    """Start the Codex and Claude history-to-topic sync loops when enabled."""
+    global _codex_history_sync_task, _claude_history_sync_task
+
     _codex_history_sync_task = start_codex_history_sync(application.bot)
     if _codex_history_sync_task:
         logger.info("Codex history sync task started")
+
+    _claude_history_sync_task = start_claude_history_sync(application.bot)
+    if _claude_history_sync_task:
+        logger.info("Claude history sync task started")
 
 
 async def _send_shutdown_notification(application: Application) -> None:
@@ -501,7 +514,7 @@ async def post_stop(application: Application) -> None:
 
 
 async def post_shutdown(_application: Application) -> None:
-    global _status_poll_task, _codex_history_sync_task
+    global _status_poll_task, _codex_history_sync_task, _claude_history_sync_task
 
     # Stop status polling
     if _status_poll_task:
@@ -517,6 +530,13 @@ async def post_shutdown(_application: Application) -> None:
             await _codex_history_sync_task
         _codex_history_sync_task = None
         logger.info("Codex history sync stopped")
+
+    if _claude_history_sync_task:
+        _claude_history_sync_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await _claude_history_sync_task
+        _claude_history_sync_task = None
+        logger.info("Claude history sync stopped")
 
     # Stop session monitor first (it may enqueue messages to workers)
     if session_monitor:

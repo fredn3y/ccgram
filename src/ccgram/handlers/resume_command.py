@@ -292,7 +292,9 @@ def _scan_index_file(
             entry.get("summary", "") or entry.get("firstPrompt", "") or session_id[:12]
         )
         seen_ids.add(session_id)
-        candidates.append((mtime, ResumeEntry(session_id, summary, cwd)))
+        candidates.append(
+            (mtime, ResumeEntry(session_id, summary, cwd, str(file_path)))
+        )
 
 
 def _scan_bare_jsonl(
@@ -322,7 +324,12 @@ def _scan_bare_jsonl(
 
         seen_ids.add(session_id)
         candidates.append(
-            (mtime, ResumeEntry(session_id, summary or session_id[:12], cwd))
+            (
+                mtime,
+                ResumeEntry(
+                    session_id, summary or session_id[:12], cwd, str(jsonl_file)
+                ),
+            )
         )
 
 

@@ -15,6 +15,7 @@ from telegram.constants import ChatAction
 from telegram.ext import ContextTypes
 
 from .callback_helpers import get_thread_id as _get_thread_id
+from .claude_history_sync import submit_to_pending_claude_topic
 from .codex_history_sync import submit_or_activate_pending_codex_topic
 from .directory_browser import (
     BROWSE_DIRS_KEY,
@@ -392,6 +393,41 @@ async def _handle_pending_codex_topic(
     return False, None
 
 
+async def _handle_pending_claude_topic(
+    user_id: int,
+    thread_id: int,
+    chat_id: int,
+    text: str,
+    bot: Bot,
+    message: Message,
+) -> bool:
+    """Handle history-synced Claude topics before tmux routing."""
+    pending_action = await submit_to_pending_claude_topic(
+        user_id,
+        thread_id,
+        chat_id,
+        text,
+        bot,
+    )
+    if pending_action.status == "submitted":
+        await ack_reaction(bot, message.chat.id, message.message_id)
+        from .command_history import record_command
+
+        record_command(user_id, thread_id, text)
+        return True
+    if pending_action.status == "busy":
+        await safe_reply(
+            message,
+            "⏳ Claude is already working in this thread. "
+            "Try again when the current turn finishes.",
+        )
+        return True
+    if pending_action.status == "failed":
+        await safe_reply(message, f"⚠️ {pending_action.message}")
+        return True
+    return False
+
+
 async def handle_text_message(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -443,6 +479,17 @@ async def handle_text_message(
     if handled:
         return
     window_id = pending_window_id or window_id
+
+    # History-synced Claude topic — continue via headless resume turn.
+    if await _handle_pending_claude_topic(
+        user.id,
+        thread_id,
+        chat.id,
+        text,
+        context.bot,
+        message,
+    ):
+        return
 
     # Unbound topic — show picker or browser
     if window_id is None and await _handle_unbound_topic(

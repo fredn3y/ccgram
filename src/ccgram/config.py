@@ -143,6 +143,7 @@ class Config:
         )
 
         self._init_codex()
+        self._init_claude_history()
 
         # Directory browser: show hidden (dot) directories
         self.show_hidden_dirs: bool = _env_with_fallback(
@@ -235,6 +236,40 @@ class Config:
         except ValueError as e:
             raise ValueError(
                 f"CCGRAM_CODEX_APP_SERVER_TIMEOUT must be a valid number: {e}"
+            ) from e
+
+    def _init_claude_history(self) -> None:
+        """Claude Code history sync: mirror Claude sessions into Telegram topics.
+
+        Unlike the Codex sync this is not gated on the default provider —
+        "auto" enables it whenever a Claude projects directory exists, so a
+        Codex-provider deployment can mirror Claude Code chats alongside.
+        """
+        raw = os.getenv("CCGRAM_CLAUDE_HISTORY_SYNC", "auto").lower()
+        if raw in ("0", "false", "no", "off"):
+            self.claude_history_sync_enabled = False
+        elif raw in ("1", "true", "yes", "on"):
+            self.claude_history_sync_enabled = True
+        else:
+            self.claude_history_sync_enabled = (
+                self.claude_projects_path.exists()
+                or self.provider_name.lower() == "claude"
+            )
+        self.claude_history_sync_interval = max(
+            2.0,
+            float(os.getenv("CCGRAM_CLAUDE_HISTORY_SYNC_INTERVAL", "5.0")),
+        )
+        self.claude_history_sync_file = self.config_dir / "claude_history_topics.json"
+        # Model for headless resume turns; empty uses the Claude CLI default.
+        self.claude_history_model = os.getenv("CCGRAM_CLAUDE_HISTORY_MODEL", "")
+        try:
+            self.claude_history_turn_timeout = max(
+                60.0,
+                float(os.getenv("CCGRAM_CLAUDE_HISTORY_TURN_TIMEOUT", "1800")),
+            )
+        except ValueError as e:
+            raise ValueError(
+                f"CCGRAM_CLAUDE_HISTORY_TURN_TIMEOUT must be a valid number: {e}"
             ) from e
 
     def _init_live_view(self) -> None:
